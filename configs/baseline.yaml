@@ -1,0 +1,48 @@
+# Experiment 001: U-Net Baseline
+# 目标：验证数据 -> 训练 -> 验证 -> 推理的完整 pipeline。
+
+experiment:
+  name: exp001_unet_baseline
+
+data:
+  root: data                # 数据根目录（兼容 data/<organ>/train 与 data/train 两种结构）
+  marker: CD68              # 目标标记：CD68 / CD45RO / HLA-DR / Vimentin
+  split_dir: data/splits    # ROI 划分文件目录（先运行 make_splits）
+  num_workers: 12           # 数据加载进程数（机器 20 核，12 个 worker 喂饱 GPU）
+
+model:
+  type: unet                # 见 src/models/registry.py 注册表
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  depth: 4
+
+loss:
+  lambda_l1: 1.0
+  lambda_ssim: 1.0
+  lambda_perceptual: 0.0    # 基线阶段关闭感知损失
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  brightness: 0.1
+  contrast: 0.1
+  noise_std: 0.01
+
+training:
+  epochs: 100
+  batch_size: 64            # 显存充足（48GB 仅用 4GB），加大 batch 摊薄每步固定开销
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  amp: true                 # 混合精度训练（仅 CUDA 生效，显著提速）
+
+inference:
+  output_dir: results
+  suffix: _fake
+
+runtime:
+  device: auto              # auto / cpu / cuda / cuda:0
+  seed: 42
+  deterministic: false      # 关闭确定性卷积，启用 cuDNN 自动调优（固定 256x256 输入提速显著）

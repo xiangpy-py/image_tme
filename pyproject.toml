@@ -1,0 +1,27 @@
+[project]
+name = "image-tme"
+version = "0.1.0"
+description = "人智算法大赛"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.2",
+    "opencv-python>=5.0.0.93",
+    "pillow>=12.3.0",
+    "pyyaml>=6.0.3",
+    "scikit-image>=0.26.0",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "tqdm>=4.70.0",
+]
+
+[project.scripts]
+image-tme = "image_tme:main"
+
+[[tool.uv.index]]
+url = "https://pypi.mirrors.ustc.edu.cn/simple/"
+default = true
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

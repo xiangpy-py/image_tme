@@ -1,0 +1,48 @@
+# Experiment 004: 多标记条件联合生成（一对多）
+# 目标：DAPI + Marker Token -> 统一模型，一次训练支持四种标记生成，
+#       对应赛题「一对多联合建模」创新加分项。
+
+experiment:
+  name: exp004_multi_marker
+
+data:
+  root: data
+  split_dir: data/splits
+  num_workers: 4
+  # 多标记模式无需指定 data.marker，训练时随机采样目标标记
+
+model:
+  type: conditional_unet
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  depth: 4
+  num_markers: 4            # CD68 / CD45RO / HLA-DR / Vimentin
+
+loss:
+  lambda_l1: 1.0
+  lambda_ssim: 1.0
+  lambda_perceptual: 0.0
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  brightness: 0.1
+  contrast: 0.1
+  noise_std: 0.01
+
+training:
+  epochs: 150               # 多任务共享参数，适当增加训练轮数
+  batch_size: 16
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+
+inference:
+  output_dir: results
+  suffix: _fake
+
+runtime:
+  device: auto
+  seed: 42

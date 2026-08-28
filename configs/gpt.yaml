@@ -1,0 +1,61 @@
+# Experiment 005: GPTUNet（Global Pixel Transformers 论文复现路线）
+# 思想来源：Liu et al., "Global Pixel Transformers for Virtual Staining
+#           of Microscopy Images"
+# 架构：浅层 CNN + 深层 GPT（GDT/GST/GUT）+ Dense Block + 多尺度输入。
+
+experiment:
+  name: exp005_gpt_unet
+
+data:
+  root: data
+  marker: CD68
+  split_dir: data/splits
+  num_workers: 4
+  # 多尺度输入（论文 Multi-Scale Input 策略，patch 已切好故做等价近似）：
+  # 2.0 -> 低分辨率全图近似全局视野；0.5 -> 中心裁剪放大捕捉局部细节。
+  # 启用后输入通道数 = 3 x 3 = 9，与 model.in_channels 对应。
+  multiscale:
+    enabled: true
+    scales: [0.5, 1.0, 2.0]
+
+model:
+  type: gpt_unet
+  in_channels: 9            # 3 通道 x 3 个尺度
+  out_channels: 1
+  stem_channels: 32         # 论文 Table II 输入层宽度
+  growth_rate: 16           # 论文 Dense Block 增长率
+  enc_layers: [2, 4, 8]     # 论文编码器 Dense Block 层数
+  enc_channels: [64, 128, 256]
+  bottleneck_layers: 8
+  bottleneck_channels: 384
+  dec_layers: [4, 2, 1]
+  dec_channels: [288, 165, 90]
+  dropout: 0.0              # 论文为 0.5；数据量较大时可适当开启
+
+loss:
+  lambda_l1: 1.0
+  lambda_ssim: 1.0
+  lambda_perceptual: 0.0
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  brightness: 0.1
+  contrast: 0.1
+  noise_std: 0.01
+
+training:
+  epochs: 100
+  batch_size: 4             # GPT 层显存开销大，参考论文 batch_size=4
+  lr: 1.0e-4                # 论文为 Adam+1e-5，本工程用 AdamW+cosine
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+
+inference:
+  output_dir: results
+  suffix: _fake
+
+runtime:
+  device: auto
+  seed: 42
