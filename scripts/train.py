@@ -20,7 +20,6 @@
 """
 
 import argparse
-import copy
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -28,10 +27,14 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.datasets import MARKERS
-from src.datasets.constants import sanitize_marker_name
 from src.engine import Trainer
 from src.models import is_conditional_model
-from src.utils import load_config, merge_config_with_args, save_config
+from src.utils import (
+    build_marker_config,
+    load_config,
+    merge_config_with_args,
+    save_config,
+)
 
 
 def train_one(config: Dict[str, Any]) -> float:
@@ -48,31 +51,6 @@ def train_one(config: Dict[str, Any]) -> float:
     # 保存实际生效的配置，保证实验可复现。
     save_config(config, str(trainer.log_dir / "config.yaml"))
     return trainer.fit()
-
-
-def build_marker_config(
-    config: Dict[str, Any], marker: str
-) -> Dict[str, Any]:
-    """为指定标记生成独立配置：写入目标标记并派生实验名。
-
-    实验名约定为 ``<原实验名>_<标记名小写>``，例如
-    ``exp001_unet_baseline_cd68``，与推理阶段的权重查找约定一致。
-
-    Args:
-        config: 基础配置（不修改传入对象）。
-        marker: 目标标记名。
-
-    Returns:
-        Dict[str, Any]: 该标记的独立配置副本。
-    """
-    marker_config = copy.deepcopy(config)
-    marker_config.setdefault("data", {})["marker"] = marker
-
-    base_name = marker_config.get("experiment", {}).get("name", "exp")
-    marker_config.setdefault("experiment", {})["name"] = (
-        f"{base_name}_{sanitize_marker_name(marker)}"
-    )
-    return marker_config
 
 
 def parse_args() -> argparse.Namespace:

@@ -102,3 +102,53 @@ def get_nested(config: Dict[str, Any], path: str, default: Optional[Any] = None)
             return default
         current = current[key]
     return current
+
+
+def deep_merge(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """递归合并两个字典，overrides 中的值优先。
+
+    用于实验矩阵中「基础配置 + 局部覆盖」的组合方式，
+    嵌套字典逐层合并而非整体替换。
+
+    Args:
+        base:      基础配置（不修改传入对象）。
+        overrides: 覆盖项。
+
+    Returns:
+        Dict[str, Any]: 合并后的新配置字典。
+    """
+    merged = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def build_marker_config(
+    config: Dict[str, Any], marker: str
+) -> Dict[str, Any]:
+    """为指定标记生成独立配置：写入目标标记并派生实验名。
+
+    实验名约定为 ``<原实验名>_<标记名小写>``，例如
+    ``exp001_unet_baseline_cd68``，与推理阶段的权重查找约定一致。
+
+    Args:
+        config: 基础配置（不修改传入对象）。
+        marker: 目标标记名。
+
+    Returns:
+        Dict[str, Any]: 该标记的独立配置副本。
+    """
+    # 延迟导入，避免与 datasets 包形成循环依赖。
+    from ..datasets.constants import sanitize_marker_name
+
+    marker_config = copy.deepcopy(config)
+    marker_config.setdefault("data", {})["marker"] = marker
+
+    base_name = marker_config.get("experiment", {}).get("name", "exp")
+    marker_config.setdefault("experiment", {})["name"] = (
+        f"{base_name}_{sanitize_marker_name(marker)}"
+    )
+    return marker_config

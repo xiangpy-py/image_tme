@@ -45,12 +45,15 @@ def _build_train_val_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Dataset]
         Tuple[Dataset, Dataset]: (训练数据集, 验证数据集)。
     """
     data_cfg = config.get("data", {})
-    model_cfg = config.get("model", {})
 
     root = data_cfg.get("root", "data")
     marker = data_cfg.get("marker", "CD68")
     split_dir = data_cfg.get("split_dir", "data/splits")
-    multi_marker = model_cfg.get("type") == "conditional_unet"
+    # 所有条件模型（conditional_unet / _v2 / adapter_unet）都需随机采样
+    # 目标标记，统一走 MultiMarkerDataset；延迟导入避免包间循环依赖。
+    from ..models import is_conditional_model
+
+    multi_marker = is_conditional_model(config)
     multiscale = _build_multiscale(config)
 
     # 优先复用已保存的 ROI 划分；不存在时退化为数据集内部全量+验证复制。

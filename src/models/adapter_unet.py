@@ -93,9 +93,13 @@ class AdapterUNet(nn.Module):
         base_channels: int = 64,
         depth: int = 4,
         num_markers: int = len(MARKERS),
+        return_shared: bool = False,
     ) -> None:
         super().__init__()
         self.depth = depth
+        # 开启后 forward 额外返回适配器前的共享特征，
+        # 供 CrossMarkerConsistencyLoss 约束跨标记一致性。
+        self.return_shared = return_shared
 
         # ---- Shared Encoder ----
         self.stem = DoubleConv(in_channels, base_channels)
@@ -130,7 +134,8 @@ class AdapterUNet(nn.Module):
             marker_idx: (B,) 整型
 
         Returns:
-            torch.Tensor: (B, C_out, H, W)，取值 [0, 1]
+            torch.Tensor: (B, C_out, H, W)，取值 [0, 1]；
+                ``return_shared=True`` 时返回 ``(预测, 共享特征)`` 元组。
         """
         skips: List[torch.Tensor] = []
 
@@ -141,10 +146,14 @@ class AdapterUNet(nn.Module):
             skips.append(feature)
 
         # Bottleneck：通过 marker adapter 注入标记特异性
-        feature = self.adapter(skips.pop(), marker_idx)
+        shared_feature = skips.pop()
+        feature = self.adapter(shared_feature, marker_idx)
 
         for decoder in self.decoders:
             skip = skips.pop()
             feature = decoder(feature, skip)
 
-        return torch.sigmoid(self.head(feature))
+        output = torch.sigmoid(self.head(feature))
+        if self.return_shared:
+            return output, shared_feature
+        return output

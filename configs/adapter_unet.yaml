@@ -16,12 +16,14 @@ model:
   base_channels: 64
   depth: 4
   num_markers: 4
+  return_shared: true      # 暴露瓶颈共享特征，供 CrossMarker 损失使用
 
 loss:
   lambda_l1: 1.0
   lambda_ssim: 1.0
   lambda_edge: 0.5
   lambda_perceptual: 0.0
+  lambda_cross: 0.1        # 跨标记一致性约束（共享特征独立于标记类型）
   edge_kernel_size: 3
 
 augmentation:

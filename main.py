@@ -21,11 +21,12 @@ def main() -> None:
         None
     """
     if len(sys.argv) < 2:
-        print("用法: python main.py <analyze|split|train|infer> [参数...]")
-        print("  analyze  数据统计分析")
-        print("  split    按 ROI 划分训练/验证集")
-        print("  train    模型训练")
-        print("  infer    测试集推理并生成提交结果")
+        print("用法: python main.py <analyze|split|train|experiments|infer> [参数...]")
+        print("  analyze      数据统计分析")
+        print("  split        按 ROI 划分训练/验证集")
+        print("  train        模型训练")
+        print("  experiments  实验矩阵：短实验筛选 + 长训练")
+        print("  infer        测试集推理并生成提交结果")
         raise SystemExit(1)
 
     command = sys.argv[1]
@@ -33,6 +34,7 @@ def main() -> None:
         "analyze": "analyze_data.py",
         "split": "make_splits.py",
         "train": "train.py",
+        "experiments": "run_experiments.py",
         "infer": "inference.py",
     }
     if command not in script_map:

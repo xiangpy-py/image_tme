@@ -90,6 +90,18 @@ class Predictor:
 
             cv2.imwrite(str(output_dir / f"{name}{self.suffix}.jpg"), image)
 
+    @staticmethod
+    def _unpack_predictions(output: Any) -> torch.Tensor:
+        """解包模型输出，兼容返回 (预测, 共享特征) 元组的模型。
+
+        Args:
+            output: 模型前向输出，张量或元组。
+
+        Returns:
+            torch.Tensor: 预测图像 ``(B, C, H, W)``。
+        """
+        return output[0] if isinstance(output, tuple) else output
+
     @torch.no_grad()
     def run_single_marker(self, marker: str, checkpoint_path: str) -> None:
         """用单标记模型生成一种标记的全部测试结果。
@@ -105,7 +117,7 @@ class Predictor:
 
         for batch in tqdm(self.test_loader, desc=f"infer [{marker}]"):
             inputs = batch["input"].to(self.device)
-            predictions = self.model(inputs)
+            predictions = self._unpack_predictions(self.model(inputs))
             self._save_batch(predictions, batch["name"], marker)
 
     @torch.no_grad()
@@ -127,7 +139,9 @@ class Predictor:
                     (inputs.shape[0],), marker_idx,
                     dtype=torch.long, device=self.device,
                 )
-                predictions = self.model(inputs, idx_tensor)
+                predictions = self._unpack_predictions(
+                    self.model(inputs, idx_tensor)
+                )
                 self._save_batch(predictions, batch["name"], marker)
 
     def run(self, checkpoint_paths: Dict[str, str]) -> None:

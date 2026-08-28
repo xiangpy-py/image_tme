@@ -31,13 +31,16 @@ from ..utils import (
     setup_logger,
 )
 from ..utils.ema import ModelEMA
-from ..utils.config import get_nested
+
 
 class Trainer:
     """训练器：驱动单配置实验的完整生命周期。"""
 
     def __init__(self, config: Dict[str, Any]) -> None:
         """按配置初始化训练所需的全部组件。
+
+        初始化顺序遵循依赖关系：设备 -> 数据 -> 模型 -> 损失 ->
+        优化器 -> 调度器 -> EMA，保证后构建的组件总能引用到先构建的。
 
         Args:
             config: 全局配置字典（已合并命令行覆盖项）。
@@ -78,13 +81,24 @@ class Trainer:
         self.epochs = int(train_cfg.get("epochs", 100))
         self.conditional = is_conditional_model(config)
 
-        # ---- EMA ----
-        self.use_ema = bool(train_cfg.get("ema", False))
-        self.ema = ModelEMA(self.model, decay=0.9999, warmup_steps=100) if self.use_ema else None
+        # ---- 数据（先构建，OneCycleLR 需要 train_loader 的长度） ----
+        loaders = build_dataloaders(config)
+        self.train_loader: DataLoader = loaders["train"]
+        self.val_loader: DataLoader = loaders["val"]
 
-        # ---- 学习率调度器选择 ----
-        scheduler_type = train_cfg.get("scheduler", "cosine")
-        if scheduler_type == "onecycle":
+        # ---- 模型 / 损失 / 优化器 ----
+        self.model: nn.Module = build_model(config).to(self.device)
+        self.criterion = build_loss(config).to(self.device)
+        self.optimizer: Optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=float(train_cfg.get("lr", 1e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
+        )
+
+        # ---- 学习率调度器 ----
+        # cosine 按 epoch 步进；onecycle 按 batch 步进（在 train_one_epoch 内）。
+        self.scheduler_type = str(train_cfg.get("scheduler", "cosine"))
+        if self.scheduler_type == "onecycle":
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
                 max_lr=float(train_cfg.get("lr", 1e-4)),
@@ -100,23 +114,12 @@ class Trainer:
                 eta_min=float(train_cfg.get("min_lr", 1e-6)),
             )
 
-        # ---- 数据 ----
-        loaders = build_dataloaders(config)
-        self.train_loader: DataLoader = loaders["train"]
-        self.val_loader: DataLoader = loaders["val"]
-
-        # ---- 模型 / 损失 / 优化器 ----
-        self.model: nn.Module = build_model(config).to(self.device)
-        self.criterion = build_loss(config).to(self.device)
-        self.optimizer: Optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=float(train_cfg.get("lr", 1e-4)),
-            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
-        )
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.epochs,
-            eta_min=float(train_cfg.get("min_lr", 1e-6)),
+        # ---- EMA（依赖已创建的模型，须在模型之后初始化） ----
+        self.use_ema = bool(train_cfg.get("ema", False))
+        self.ema = (
+            ModelEMA(self.model, decay=0.9999, warmup_steps=100)
+            if self.use_ema
+            else None
         )
 
         # ---- 训练状态 ----
@@ -135,25 +138,38 @@ class Trainer:
             f"设备: {self.device} | 训练样本: {len(self.train_loader.dataset)} | "
             f"验证样本: {len(self.val_loader.dataset)}"
             + (" | AMP: 开" if self.use_amp else "")
+            + (" | EMA: 开" if self.use_ema else "")
         )
 
     # ------------------------------------------------------------------ #
     # 单步前向：统一处理单标记 / 多标记条件两种模型
     # ------------------------------------------------------------------ #
-    def _forward(self, batch: Dict[str, Any]) -> torch.Tensor:
+    def _forward(
+        self, batch: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """根据模型类型执行前向传播。
 
         Args:
             batch: DataLoader 输出的批次字典。
 
         Returns:
-            torch.Tensor: 模型预测 ``(B, C, H, W)``。
+            Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+                (预测 ``(B, C, H, W)``, 辅助信息)。模型返回元组时
+                （如 AdapterUNet 的共享特征）打包进 ``aux`` 供损失使用。
         """
         inputs = batch["input"].to(self.device, non_blocking=True)
         if self.conditional:
-            marker_idx = batch["marker_idx"].to(self.device)
-            return self.model(inputs, marker_idx)
-        return self.model(inputs)
+            marker_idx = batch["marker_idx"].to(self.device, non_blocking=True)
+            output = self.model(inputs, marker_idx)
+            # 模型返回 (预测, 共享特征) 时，附加 marker_idx 供跨标记损失使用。
+            if isinstance(output, tuple):
+                predictions, shared = output
+                return predictions, {
+                    "shared_features": shared,
+                    "marker_idx": marker_idx,
+                }
+            return output, None
+        return self.model(inputs), None
 
     def train_one_epoch(self, epoch: int) -> float:
         """训练一个 epoch。
@@ -179,11 +195,11 @@ class Trainer:
             with torch.autocast(
                 device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp
             ):
-                predictions = self._forward(batch)
+                predictions, aux = self._forward(batch)
 
             # 损失计算放到 autocast 之外并强制 fp32：
             # SSIM 中的相近数相减在 fp16 下会灾难性抵消，导致 loss=NaN。
-            loss, _details = self.criterion(predictions.float(), targets)
+            loss, _details = self.criterion(predictions.float(), targets, aux=aux)
 
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
@@ -192,16 +208,32 @@ class Trainer:
             else:
                 loss.backward()
                 self.optimizer.step()
-                if self.ema is not None:
-                    self.ema.update(self.model)
+
+            # EMA 必须在每个优化 step 后更新，与是否启用 AMP 无关。
+            if self.ema is not None:
+                self.ema.update(self.model)
+
+            # OneCycleLR 按 batch 步进；cosine 在 fit() 中按 epoch 步进。
+            if self.scheduler_type == "onecycle":
+                self.scheduler.step()
+
             loss_meter.update(float(loss.detach()), predictions.shape[0])
             progress.set_postfix(loss=f"{loss_meter.avg:.4f}")
 
         return loss_meter.avg
 
-
-    @torch.no_grad()
+    # ------------------------------------------------------------------ #
+    # 验证：支持原始权重与 EMA 权重两种评估
+    # ------------------------------------------------------------------ #
     def validate(self, use_ema: bool = False) -> Dict[str, float]:
+        """在验证集上评估模型，可选择临时切换为 EMA 权重。
+
+        Args:
+            use_ema: 是否用 EMA 阴影权重评估（评估后自动恢复训练权重）。
+
+        Returns:
+            Dict[str, float]: 含 ``loss`` / ``ssim`` / ``psnr`` / ``score``。
+        """
         if use_ema and self.ema is not None:
             self.ema.apply_shadow(self.model)
             metrics = self._validate_impl()
@@ -209,8 +241,9 @@ class Trainer:
             return metrics
         return self._validate_impl()
 
+    @torch.no_grad()
     def _validate_impl(self) -> Dict[str, float]:
-        """在验证集上评估模型。
+        """验证实现：遍历验证集累计指标。
 
         Returns:
             Dict[str, float]: 含 ``loss`` / ``ssim`` / ``psnr`` / ``score``。
@@ -224,10 +257,10 @@ class Trainer:
             with torch.autocast(
                 device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp
             ):
-                predictions = self._forward(batch)
+                predictions, aux = self._forward(batch)
 
             # 与训练一致：损失在 fp32 下计算，避免 fp16 数值不稳定。
-            loss, _details = self.criterion(predictions.float(), targets)
+            loss, _details = self.criterion(predictions.float(), targets, aux=aux)
 
             loss_meter.update(float(loss), predictions.shape[0])
             accumulator.update(predictions.float(), targets.float())
@@ -236,13 +269,15 @@ class Trainer:
         metrics["loss"] = loss_meter.avg
         return metrics
 
-
-
     # ------------------------------------------------------------------ #
     # 主流程
     # ------------------------------------------------------------------ #
     def fit(self) -> float:
         """执行完整训练流程，逐 epoch 训练、验证并保存最优模型。
+
+        启用 EMA 时，每个 epoch 同时评估原始权重与 EMA 权重，
+        取分数更高者参与最优判定；若 EMA 更优，则 checkpoint
+        保存的是 EMA 权重（推理直接使用即可）。
 
         Returns:
             float: 训练过程中的最优验证综合得分。
@@ -252,8 +287,18 @@ class Trainer:
 
         for epoch in range(self.start_epoch, self.epochs):
             train_loss = self.train_one_epoch(epoch)
-            val_metrics = self.validate()
-            self.scheduler.step()
+
+            # 每个 epoch 只验证一次原始权重；启用 EMA 时再补一次 EMA 验证。
+            val_metrics = self.validate(use_ema=False)
+            weight_source = "raw"
+            if self.ema is not None:
+                ema_metrics = self.validate(use_ema=True)
+                if ema_metrics["score"] > val_metrics["score"]:
+                    val_metrics = ema_metrics
+                    weight_source = "ema"
+
+            if self.scheduler_type != "onecycle":
+                self.scheduler.step()
 
             lr = self.optimizer.param_groups[0]["lr"]
             self.recorder.log({
@@ -269,27 +314,8 @@ class Trainer:
                 f"Epoch {epoch + 1}/{self.epochs} | "
                 f"train_loss={train_loss:.4f} | val_loss={val_metrics['loss']:.4f} | "
                 f"SSIM={val_metrics['ssim']:.4f} | PSNR={val_metrics['psnr']:.2f} | "
-                f"Score={val_metrics['score']:.4f}"
+                f"Score={val_metrics['score']:.4f} | 权重来源={weight_source}"
             )
-
-            # 加入 EMA 状态
-            ckpt_dict = {
-                "epoch": epoch + 1,
-                "best_score": self.best_score,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "config": self.config,
-            }
-            if self.ema is not None:
-                ckpt_dict["ema_state_dict"] = self.ema.state_dict()
-
-            # 验证时同时评估普通权重和 EMA 权重，取最优
-            val_metrics = self.validate(use_ema=False)
-            if self.ema is not None:
-                ema_metrics = self.validate(use_ema=True)
-                if ema_metrics["score"] > val_metrics["score"]:
-                    val_metrics = ema_metrics
-                    val_metrics["source"] = "ema"
 
             # 保存最新与最优两份 checkpoint，最优按比赛综合得分判定。
             save_checkpoint(
@@ -298,11 +324,7 @@ class Trainer:
             )
             if val_metrics["score"] > self.best_score:
                 self.best_score = val_metrics["score"]
-                save_checkpoint(
-                    self.model, self.optimizer, epoch + 1, self.best_score,
-                    self.config, str(self.checkpoint_dir / "best.pth"),
-                )
-                self.logger.info(f"  -> 新的最优模型 (Score={self.best_score:.4f})")
+                self._save_best(epoch, weight_source)
 
         self.recorder.finish()
         elapsed = time.time() - start_time
@@ -310,3 +332,31 @@ class Trainer:
             f"训练完成，耗时 {elapsed / 60:.1f} 分钟，最优 Score={self.best_score:.4f}"
         )
         return self.best_score
+
+    def _save_best(self, epoch: int, weight_source: str) -> None:
+        """保存最优 checkpoint，EMA 更优时保存 EMA 阴影权重。
+
+        Args:
+            epoch:         当前轮次（从 0 开始）。
+            weight_source: 最优权重来源，``"raw"`` 或 ``"ema"``。
+
+        Returns:
+            None
+        """
+        best_path = str(self.checkpoint_dir / "best.pth")
+        if weight_source == "ema" and self.ema is not None:
+            # 临时切入 EMA 权重保存，保存后恢复训练权重。
+            self.ema.apply_shadow(self.model)
+            save_checkpoint(
+                self.model, self.optimizer, epoch + 1, self.best_score,
+                self.config, best_path,
+            )
+            self.ema.restore(self.model)
+        else:
+            save_checkpoint(
+                self.model, self.optimizer, epoch + 1, self.best_score,
+                self.config, best_path,
+            )
+        self.logger.info(
+            f"  -> 新的最优模型 (Score={self.best_score:.4f}, 来源={weight_source})"
+        )

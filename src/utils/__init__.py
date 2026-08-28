@@ -1,6 +1,12 @@
 """通用工具子包：配置、日志、随机性控制、checkpoint 与可视化。"""
 
-from .config import load_config, merge_config_with_args, save_config
+from .config import (
+    build_marker_config,
+    deep_merge,
+    load_config,
+    merge_config_with_args,
+    save_config,
+)
 from .common import AverageMeter, get_device, seed_everything
 from .logger import ExperimentLogger, setup_logger
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -10,6 +16,8 @@ __all__ = [
     "load_config",
     "merge_config_with_args",
     "save_config",
+    "deep_merge",
+    "build_marker_config",
     "AverageMeter",
     "get_device",
     "seed_everything",

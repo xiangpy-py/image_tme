@@ -1,12 +1,9 @@
-"""Version 4.1: 多标记条件生成模型 —— Multi-scale Marker Conditioning。
+"""多标记条件生成模型（一对多）。
 
-核心改进（相比原只在 bottleneck 注入 marker）：
-    Marker 条件通过 FiLM/AdaIN 方式在编码器各层和解码器各层
-    持续注入，让模型在浅层局部纹理恢复阶段也能感知目标标记类型。
-
-结构：
-    DAPI → [Encoder + MarkerCond] → Bottleneck + MarkerCond
-         → [Decoder + MarkerCond] → IHC
+包含两代实现：
+    - ConditionalUNet   : 原版，仅在瓶颈处注入 marker 嵌入；
+    - ConditionalUNetV2 : Multi-scale FiLM，在编码器/瓶颈/解码器
+      各层持续注入 marker 条件，浅层也能感知目标标记类型。
 """
 
 from typing import List
@@ -15,7 +12,84 @@ import torch
 import torch.nn as nn
 
 from ..datasets.constants import MARKERS
-from .blocks import DoubleConv, Down, Up
+from .blocks import DoubleConv, Down, MarkerEmbedding, Up
+
+
+class ConditionalUNet(nn.Module):
+    """标记条件 U-Net：在瓶颈处注入目标标记嵌入。
+
+    前向时除图像外还需提供 ``marker_idx``（batch 内每个样本
+    要生成的目标标记编号），模型据此切换生成模式。
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 1,
+        base_channels: int = 64,
+        depth: int = 4,
+        num_markers: int = len(MARKERS),
+    ) -> None:
+        """搭建条件 U-Net。
+
+        Args:
+            in_channels:  输入通道数。
+            out_channels: 输出通道数（各标记输出格式一致）。
+            base_channels: 第一层特征宽度。
+            depth:        下采样次数。
+            num_markers:  标记类别数，决定嵌入表大小。
+        """
+        super().__init__()
+        self.depth = depth
+        bottleneck_channels = base_channels << depth
+
+        self.stem = DoubleConv(in_channels, base_channels)
+        self.encoders = nn.ModuleList([
+            Down(base_channels << i, base_channels << (i + 1))
+            for i in range(depth)
+        ])
+
+        # 标记条件嵌入：加到瓶颈特征上，广播到全部空间位置。
+        self.marker_embedding = MarkerEmbedding(num_markers, bottleneck_channels)
+
+        self.decoders = nn.ModuleList()
+        for i in reversed(range(depth)):
+            self.decoders.append(
+                Up(
+                    in_channels=base_channels << (i + 1),
+                    skip_channels=base_channels << i,
+                    out_channels=base_channels << i,
+                )
+            )
+        self.head = nn.Conv2d(base_channels, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, marker_idx: torch.Tensor) -> torch.Tensor:
+        """条件前向传播。
+
+        Args:
+            x:          输入 DAPI 图像 ``(B, C_in, H, W)``。
+            marker_idx: 目标标记编号 ``(B,)``，整型，
+                编号顺序与 ``datasets.constants.MARKERS`` 一致。
+
+        Returns:
+            torch.Tensor: 指定标记的生成图像 ``(B, C_out, H, W)``，
+            取值范围 ``[0, 1]``。
+        """
+        skips = []
+
+        feature = self.stem(x)
+        skips.append(feature)
+        for encoder in self.encoders:
+            feature = encoder(feature)
+            skips.append(feature)
+
+        # 瓶颈处注入标记条件：告诉模型生成哪一种标记。
+        feature = skips.pop() + self.marker_embedding(marker_idx)
+
+        for decoder in self.decoders:
+            feature = decoder(feature, skips.pop())
+
+        return torch.sigmoid(self.head(feature))
 
 
 class FiLM(nn.Module):

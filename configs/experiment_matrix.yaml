@@ -1,0 +1,76 @@
+# 实验矩阵：赛马制「短实验筛选 -> 长训练冲刺」两阶段配置
+#
+# 策略（对应赛马制打法）：
+#   1. screening：每个实验只跑少量 epoch，用统一代理标记横向比较，
+#      快速淘汰明显不行的组合；
+#   2. full：取 screening 排行榜 Top-K 进入完整训练；
+#      单标记模型此时依次训练全部四种标记，条件模型一次训练覆盖。
+#
+# 用法：
+#   uv run image-tme experiments --matrix configs/experiment_matrix.yaml --stage screening
+#   uv run image-tme experiments --matrix configs/experiment_matrix.yaml --stage full
+#   uv run image-tme experiments --matrix configs/experiment_matrix.yaml --stage report
+
+screening:
+  epochs: 15            # 短实验轮数：足以拉开差距，又不浪费算力
+  marker: CD68          # 代理标记：单标记模型筛选阶段统一只训它，控制变量
+
+full:
+  epochs: 100           # 长训练轮数
+  top_k: 3              # 进入长训练的实验数
+
+# 每个实验 = base 配置 + overrides 局部覆盖（递归合并）。
+# name 会写入 experiment.name；screening 阶段自动追加 _screen 后缀。
+experiments:
+  # ---- 第一梯队：CNN 编码器-解码器 ----
+  - name: exp101_unet_l1
+    base: configs/baseline.yaml
+    overrides:
+      model: {type: unet}
+      loss: {lambda_l1: 1.0, lambda_ssim: 0.0}
+
+  - name: exp102_unet_l1_ssim
+    base: configs/baseline.yaml
+    overrides:
+      model: {type: unet}
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
+
+  - name: exp103_resunet_l1_ssim
+    base: configs/baseline.yaml
+    overrides:
+      model: {type: resnet_unet, backbone: resnet34, pretrained: true}
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
+
+  - name: exp104_resunet_l1_ssim_edge
+    base: configs/baseline.yaml
+    overrides:
+      model: {type: resnet_unet, backbone: resnet34, pretrained: true}
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.5}
+
+  # ---- 第二梯队：Transformer 瓶颈 ----
+  - name: exp105_transunet_l1_ssim
+    base: configs/transformer.yaml
+    overrides:
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
+
+  # ---- 一对多联合建模（创新加分方向） ----
+  - name: exp106_cond_unet
+    base: configs/multi_marker.yaml
+    overrides:
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
+
+  - name: exp107_cond_v2_film
+    base: configs/conditional_v2.yaml
+    overrides:
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.5}
+
+  - name: exp108_adapter_cross
+    base: configs/adapter_unet.yaml
+    overrides:
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.5, lambda_cross: 0.1}
+
+  # ---- 损失权重消融（以最强结构为基准微调） ----
+  - name: exp109_cond_v2_no_edge
+    base: configs/conditional_v2.yaml
+    overrides:
+      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.0}
