@@ -1,0 +1,50 @@
+# Experiment 007: Shared Encoder + Marker Adapter
+# 目标：共享结构表示 + 标记专用适配，配合 Cross-Marker Consistency
+
+experiment:
+  name: exp007_adapter_unet
+
+data:
+  root: data
+  split_dir: data/splits
+  num_workers: 4
+
+model:
+  type: adapter_unet
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  depth: 4
+  num_markers: 4
+
+loss:
+  lambda_l1: 1.0
+  lambda_ssim: 1.0
+  lambda_edge: 0.5
+  lambda_perceptual: 0.0
+  edge_kernel_size: 3
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  brightness: 0.1
+  contrast: 0.1
+  noise_std: 0.01
+
+training:
+  epochs: 150
+  batch_size: 16
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  ema: true
+  amp: true
+
+inference:
+  output_dir: results
+  suffix: _fake
+
+runtime:
+  device: auto
+  seed: 42

@@ -30,7 +30,8 @@ from ..utils import (
     seed_everything,
     setup_logger,
 )
-
+from ..utils.ema import ModelEMA
+from ..utils.config import get_nested
 
 class Trainer:
     """训练器：驱动单配置实验的完整生命周期。"""
@@ -76,6 +77,28 @@ class Trainer:
 
         self.epochs = int(train_cfg.get("epochs", 100))
         self.conditional = is_conditional_model(config)
+
+        # ---- EMA ----
+        self.use_ema = bool(train_cfg.get("ema", False))
+        self.ema = ModelEMA(self.model, decay=0.9999, warmup_steps=100) if self.use_ema else None
+
+        # ---- 学习率调度器选择 ----
+        scheduler_type = train_cfg.get("scheduler", "cosine")
+        if scheduler_type == "onecycle":
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=float(train_cfg.get("lr", 1e-4)),
+                total_steps=self.epochs * len(self.train_loader),
+                pct_start=0.3,  # 30% 时间用于 warmup
+                div_factor=25.0,
+                final_div_factor=1e4,
+            )
+        else:
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.epochs,
+                eta_min=float(train_cfg.get("min_lr", 1e-6)),
+            )
 
         # ---- 数据 ----
         loaders = build_dataloaders(config)
@@ -169,14 +192,24 @@ class Trainer:
             else:
                 loss.backward()
                 self.optimizer.step()
-
+                if self.ema is not None:
+                    self.ema.update(self.model)
             loss_meter.update(float(loss.detach()), predictions.shape[0])
             progress.set_postfix(loss=f"{loss_meter.avg:.4f}")
 
         return loss_meter.avg
 
+
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
+    def validate(self, use_ema: bool = False) -> Dict[str, float]:
+        if use_ema and self.ema is not None:
+            self.ema.apply_shadow(self.model)
+            metrics = self._validate_impl()
+            self.ema.restore(self.model)
+            return metrics
+        return self._validate_impl()
+
+    def _validate_impl(self) -> Dict[str, float]:
         """在验证集上评估模型。
 
         Returns:
@@ -202,6 +235,8 @@ class Trainer:
         metrics = accumulator.compute()
         metrics["loss"] = loss_meter.avg
         return metrics
+
+
 
     # ------------------------------------------------------------------ #
     # 主流程
@@ -236,6 +271,25 @@ class Trainer:
                 f"SSIM={val_metrics['ssim']:.4f} | PSNR={val_metrics['psnr']:.2f} | "
                 f"Score={val_metrics['score']:.4f}"
             )
+
+            # 加入 EMA 状态
+            ckpt_dict = {
+                "epoch": epoch + 1,
+                "best_score": self.best_score,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "config": self.config,
+            }
+            if self.ema is not None:
+                ckpt_dict["ema_state_dict"] = self.ema.state_dict()
+
+            # 验证时同时评估普通权重和 EMA 权重，取最优
+            val_metrics = self.validate(use_ema=False)
+            if self.ema is not None:
+                ema_metrics = self.validate(use_ema=True)
+                if ema_metrics["score"] > val_metrics["score"]:
+                    val_metrics = ema_metrics
+                    val_metrics["source"] = "ema"
 
             # 保存最新与最优两份 checkpoint，最优按比赛综合得分判定。
             save_checkpoint(

@@ -1,42 +1,28 @@
-"""模型注册表：按配置名统一实例化模型。
-
-新增模型时只需在 ``MODEL_REGISTRY`` 中登记，
-训练/推理脚本无需改动即可通过 YAML 的 ``model.type`` 切换。
-"""
+"""模型注册表：按配置名统一实例化模型。"""
 
 from typing import Any, Callable, Dict
 
 import torch.nn as nn
 
-from .conditional_unet import ConditionalUNet
+from .adapter_unet import AdapterUNet
+from .conditional_unet import ConditionalUNet, ConditionalUNetV2
 from .gpt_unet import GPTUNet
 from .resnet_unet import ResNetUNet
 from .trans_unet import TransUNet
 from .unet import UNet
 
-# 模型名 -> 构造函数，构造函数签名为 (**model_config) -> nn.Module
 MODEL_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     "unet": UNet,
     "resnet_unet": ResNetUNet,
     "trans_unet": TransUNet,
-    "conditional_unet": ConditionalUNet,
+    "conditional_unet": ConditionalUNet,      # 原版：仅 bottleneck 条件
+    "conditional_unet_v2": ConditionalUNetV2,  # 新版：Multi-scale FiLM
+    "adapter_unet": AdapterUNet,               # 共享编码器 + Marker Adapter
     "gpt_unet": GPTUNet,
 }
 
 
 def build_model(config: Dict[str, Any]) -> nn.Module:
-    """根据配置创建模型实例。
-
-    Args:
-        config: 全局配置字典，读取 ``model`` 一节，
-            其中 ``type`` 指定模型名，其余字段透传给构造函数。
-
-    Returns:
-        nn.Module: 实例化后的模型（尚未移动到计算设备）。
-
-    Raises:
-        ValueError: 未知的模型类型时抛出。
-    """
     model_cfg = dict(config.get("model", {}) or {})
     model_type = model_cfg.pop("type", "unet")
 
@@ -49,12 +35,10 @@ def build_model(config: Dict[str, Any]) -> nn.Module:
 
 
 def is_conditional_model(config: Dict[str, Any]) -> bool:
-    """判断当前配置对应的模型是否需要 marker 条件输入。
-
-    Args:
-        config: 全局配置字典。
-
-    Returns:
-        bool: 多标记条件模型返回 ``True``，其余返回 ``False``。
-    """
-    return config.get("model", {}).get("type") == "conditional_unet"
+    """判断是否需要 marker_idx 输入（含所有条件/适配器模型）。"""
+    conditional_types = {
+        "conditional_unet",
+        "conditional_unet_v2",
+        "adapter_unet",
+    }
+    return config.get("model", {}).get("type") in conditional_types

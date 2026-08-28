@@ -1,0 +1,53 @@
+# Experiment 006: Multi-scale Conditional U-Net (FiLM)
+# 目标：在编码器/解码器各层注入 marker 条件，提升标记特异性
+
+experiment:
+  name: exp006_conditional_v2
+
+data:
+  root: data
+  split_dir: data/splits
+  num_workers: 4
+
+model:
+  type: conditional_unet_v2
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  depth: 4
+  num_markers: 4
+  embed_dim: 128
+
+loss:
+  lambda_l1: 1.0
+  lambda_ssim: 1.0
+  lambda_edge: 0.5        # 新增 Edge Loss
+  lambda_perceptual: 0.0
+  edge_kernel_size: 3
+  edge_smooth_sigma: 1.0
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  brightness: 0.1
+  contrast: 0.1
+  noise_std: 0.01
+
+training:
+  epochs: 150
+  batch_size: 16
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  scheduler: cosine      # 或改为 onecycle
+  ema: true              # 启用 EMA
+  amp: true
+
+inference:
+  output_dir: results
+  suffix: _fake
+
+runtime:
+  device: auto
+  seed: 42
