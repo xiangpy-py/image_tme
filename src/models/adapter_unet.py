@@ -74,7 +74,8 @@ class MarkerAdapter(nn.Module):
             mask = marker_idx == m_idx
             if mask.any():
                 adapted = self.adapters[m_idx](feature[mask])
-                output[mask] = feature[mask] + self.residual_scale * adapted
+                adapted = feature[mask] + self.residual_scale * adapted
+                output[mask] = adapted.to(feature.dtype)
 
         return output
 
