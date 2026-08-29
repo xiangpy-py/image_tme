@@ -110,6 +110,22 @@ def read_image_as_float(path: Path, grayscale: bool = False) -> np.ndarray:
     Returns:
         np.ndarray: HWC 布局、float32、取值 ``[0, 1]`` 的图像数组。
     """
+    return _uint8_to_float(read_image_as_uint8(path, grayscale))
+
+
+def read_image_as_uint8(path: Path, grayscale: bool = False) -> np.ndarray:
+    """读取图像为 uint8 数组（HWC），供内存缓存预加载使用。
+
+    Args:
+        path:      图像文件路径。
+        grayscale: 是否按单通道灰度读取。
+
+    Returns:
+        np.ndarray: HWC 布局的 uint8 图像数组。
+
+    Raises:
+        IOError: 图像读取失败时抛出。
+    """
     flag = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_UNCHANGED
     image = cv2.imread(str(path), flag)
     if image is None:
@@ -121,7 +137,12 @@ def read_image_as_float(path: Path, grayscale: bool = False) -> np.ndarray:
     elif image.ndim == 2:
         image = image[..., None]  # 灰度图补通道维 -> (H, W, 1)
 
-    return (image.astype(np.float32) / 255.0)
+    return image
+
+
+def _uint8_to_float(image: np.ndarray) -> np.ndarray:
+    """将 uint8 图像转换为 ``[0, 1]`` 范围的 float32 数组。"""
+    return image.astype(np.float32) / 255.0
 
 
 def _to_tensor(image: np.ndarray) -> torch.Tensor:
@@ -149,6 +170,7 @@ class VirtualStainingDataset(Dataset):
         transform: Optional[Callable] = None,
         file_list: Optional[List[str]] = None,
         multiscale: Optional[MultiScaleInput] = None,
+        cache: bool = False,
     ) -> None:
         """收集 DAPI 与目标标记的同名配对样本。
 
@@ -161,6 +183,8 @@ class VirtualStainingDataset(Dataset):
                 为 ``None`` 时使用目录下全部样本。
             multiscale: 可选的多尺度输入变换（论文 GPTs 的输入策略），
                 仅作用于输入图像；启用后输入通道数变为 ``C * len(scales)``。
+            cache:      是否将全部图像以 uint8 预加载到内存，
+                避免每个 epoch 重复解码 JPG（多 worker 时经 fork 共享内存）。
 
         Raises:
             ValueError: 标记名非法或未找到任何配对样本时抛出。
@@ -197,6 +221,19 @@ class VirtualStainingDataset(Dataset):
                 f"未找到配对样本: root={root}, marker={marker}, split={split}"
             )
 
+        # 可选的内存缓存：一次性解码全部图像，后续按索引直接取。
+        self._cache: Optional[List[Tuple[np.ndarray, Optional[np.ndarray]]]] = None
+        if cache:
+            self._cache = [
+                (
+                    read_image_as_uint8(source_path),
+                    read_image_as_uint8(target_path, grayscale=True)
+                    if target_path
+                    else None,
+                )
+                for source_path, target_path in self.samples
+            ]
+
     def __len__(self) -> int:
         """返回配对样本总数。"""
         return len(self.samples)
@@ -212,8 +249,17 @@ class VirtualStainingDataset(Dataset):
         """
         source_path, target_path = self.samples[index]
 
-        image = read_image_as_float(source_path)
-        target = read_image_as_float(target_path, grayscale=True) if target_path else None
+        if self._cache is not None:
+            source_uint8, target_uint8 = self._cache[index]
+            image = _uint8_to_float(source_uint8)
+            target = _uint8_to_float(target_uint8) if target_uint8 is not None else None
+        else:
+            image = read_image_as_float(source_path)
+            target = (
+                read_image_as_float(target_path, grayscale=True)
+                if target_path
+                else None
+            )
 
         if self.transform is not None:
             image, target = self.transform(image, target)
@@ -256,6 +302,7 @@ class MultiMarkerDataset(Dataset):
         transform: Optional[Callable] = None,
         file_list: Optional[List[str]] = None,
         multiscale: Optional[MultiScaleInput] = None,
+        cache: bool = False,
     ) -> None:
         """收集同时存在全部目标标记真值的样本。
 
@@ -269,6 +316,7 @@ class MultiMarkerDataset(Dataset):
             transform:  增强流水线。
             file_list:  ROI 划分文件名白名单。
             multiscale: 可选的多尺度输入变换，仅作用于输入图像。
+            cache:      是否将全部图像以 uint8 预加载到内存。
 
         Raises:
             ValueError: 未找到任何全配对样本时抛出。
@@ -307,6 +355,22 @@ class MultiMarkerDataset(Dataset):
 
         self.names = sorted(self.index.keys())
 
+        # 可选的内存缓存：一次性解码全部源图与四类真值。
+        self._cache: Optional[
+            Dict[str, Tuple[np.ndarray, Dict[str, np.ndarray]]]
+        ] = None
+        if cache:
+            self._cache = {
+                name: (
+                    read_image_as_uint8(source_path),
+                    {
+                        marker: read_image_as_uint8(path, grayscale=True)
+                        for marker, path in target_map.items()
+                    },
+                )
+                for name, (source_path, target_map) in self.index.items()
+            }
+
     def __len__(self) -> int:
         """返回样本总数（每样本每 epoch 随机配对一种标记）。"""
         return len(self.names)
@@ -327,8 +391,13 @@ class MultiMarkerDataset(Dataset):
         marker_idx = np.random.randint(0, len(self.markers))
         marker = self.markers[marker_idx]
 
-        image = read_image_as_float(source_path)
-        target = read_image_as_float(target_map[marker], grayscale=True)
+        if self._cache is not None:
+            source_uint8, cached_targets = self._cache[name]
+            image = _uint8_to_float(source_uint8)
+            target = _uint8_to_float(cached_targets[marker])
+        else:
+            image = read_image_as_float(source_path)
+            target = read_image_as_float(target_map[marker], grayscale=True)
 
         if self.transform is not None:
             image, target = self.transform(image, target)

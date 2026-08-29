@@ -8,7 +8,8 @@ data:
   root: data
   marker: CD68
   split_dir: data/splits
-  num_workers: 4
+  num_workers: 8
+  cache: true             # 全部图像预加载到内存，免去每 epoch 重复解码 JPG
 
 model:
   type: trans_unet
@@ -39,6 +40,8 @@ training:
   lr: 1.0e-4
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
+  amp: true              # 混合精度训练
+  compile: true          # torch.compile 图优化（仅 CUDA 生效）
 
 inference:
   output_dir: results
@@ -46,4 +49,5 @@ inference:
 
 runtime:
   device: auto
+  deterministic: false  # 关闭确定性卷积，启用 cuDNN 自动调优
   seed: 42

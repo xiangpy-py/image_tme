@@ -55,6 +55,9 @@ def _build_train_val_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Dataset]
 
     multi_marker = is_conditional_model(config)
     multiscale = _build_multiscale(config)
+    # 内存缓存开关：data.cache=true 时一次性解码全部图像，
+    # 避免每个 epoch 重复 JPG 解码（约 1~2 GB uint8 内存）。
+    cache = bool(data_cfg.get("cache", False))
 
     # 优先复用已保存的 ROI 划分；不存在时退化为数据集内部全量+验证复制。
     split_file = Path(split_dir) / "split.json"
@@ -67,23 +70,23 @@ def _build_train_val_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Dataset]
         train_dataset = MultiMarkerDataset(
             root=root, split="train",
             transform=build_transforms(config, train=True),
-            file_list=train_list, multiscale=multiscale,
+            file_list=train_list, multiscale=multiscale, cache=cache,
         )
         val_dataset = MultiMarkerDataset(
             root=root, split="train",
             transform=build_transforms(config, train=False),
-            file_list=val_list, multiscale=multiscale,
+            file_list=val_list, multiscale=multiscale, cache=cache,
         )
     else:
         train_dataset = VirtualStainingDataset(
             root=root, marker=marker, split="train",
             transform=build_transforms(config, train=True),
-            file_list=train_list, multiscale=multiscale,
+            file_list=train_list, multiscale=multiscale, cache=cache,
         )
         val_dataset = VirtualStainingDataset(
             root=root, marker=marker, split="train",
             transform=build_transforms(config, train=False),
-            file_list=val_list, multiscale=multiscale,
+            file_list=val_list, multiscale=multiscale, cache=cache,
         )
 
     return train_dataset, val_dataset
@@ -99,8 +102,13 @@ def build_dataloaders(config: Dict[str, Any]) -> Dict[str, DataLoader]:
         Dict[str, DataLoader]: 含 ``"train"`` 与 ``"val"`` 两个字典项。
     """
     train_cfg = config.get("training", {})
+    data_cfg = config.get("data", {})
     batch_size = int(train_cfg.get("batch_size", 16))
-    num_workers = int(config.get("data", {}).get("num_workers", 4))
+    num_workers = int(data_cfg.get("num_workers", 4))
+    # num_workers=0 时 prefetch_factor 必须为 None，否则 DataLoader 报错。
+    prefetch_factor = (
+        int(data_cfg.get("prefetch_factor", 2)) if num_workers > 0 else None
+    )
 
     train_dataset, val_dataset = _build_train_val_datasets(config)
 
@@ -112,6 +120,7 @@ def build_dataloaders(config: Dict[str, Any]) -> Dict[str, DataLoader]:
         pin_memory=True,
         drop_last=True,
         persistent_workers=num_workers > 0,
+        prefetch_factor=prefetch_factor,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -119,6 +128,7 @@ def build_dataloaders(config: Dict[str, Any]) -> Dict[str, DataLoader]:
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        prefetch_factor=prefetch_factor,
     )
     return {"train": train_loader, "val": val_loader}
 

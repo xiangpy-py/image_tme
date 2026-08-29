@@ -66,7 +66,6 @@ class MarkerAdapter(nn.Module):
         Returns:
             torch.Tensor: 适配后的特征 (B, C, H, W)
         """
-        batch = feature.shape[0]
         output = torch.zeros_like(feature)
 
         # 按 marker 分组处理，避免 batch 内不同 marker 的串扰
@@ -74,6 +73,8 @@ class MarkerAdapter(nn.Module):
             mask = marker_idx == m_idx
             if mask.any():
                 adapted = self.adapters[m_idx](feature[mask])
+                # AMP 下 residual_scale(fp32)会把结果提升到 fp32，
+                # 显式转回特征的数据类型，避免 index-put 的 dtype 冲突。
                 adapted = feature[mask] + self.residual_scale * adapted
                 output[mask] = adapted.to(feature.dtype)
 

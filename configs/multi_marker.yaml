@@ -8,7 +8,8 @@ experiment:
 data:
   root: data
   split_dir: data/splits
-  num_workers: 4
+  num_workers: 8
+  cache: true             # 全部图像预加载到内存，免去每 epoch 重复解码 JPG
   # 多标记模式无需指定 data.marker，训练时随机采样目标标记
 
 model:
@@ -34,10 +35,12 @@ augmentation:
 
 training:
   epochs: 150               # 多任务共享参数，适当增加训练轮数
-  batch_size: 16
+  batch_size: 32
   lr: 1.0e-4
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
+  amp: true              # 混合精度训练
+  compile: true          # torch.compile 图优化（仅 CUDA 生效）
 
 inference:
   output_dir: results
@@ -45,4 +48,5 @@ inference:
 
 runtime:
   device: auto
+  deterministic: false  # 关闭确定性卷积，启用 cuDNN 自动调优
   seed: 42

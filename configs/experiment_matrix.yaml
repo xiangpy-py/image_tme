@@ -17,7 +17,7 @@ screening:
 
 full:
   epochs: 100           # 长训练轮数
-  top_k: 3              # 进入长训练的实验数
+  top_k: 4              # 进入长训练的实验数
 
 # 每个实验 = base 配置 + overrides 局部覆盖（递归合并）。
 # name 会写入 experiment.name；screening 阶段自动追加 _screen 后缀。

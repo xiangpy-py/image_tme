@@ -87,10 +87,17 @@ class Trainer:
         self.val_loader: DataLoader = loaders["val"]
 
         # ---- 模型 / 损失 / 优化器 ----
-        self.model: nn.Module = build_model(config).to(self.device)
+        # base_model 始终为原始模型；启用 torch.compile 时 self.model
+        # 为编译后的包装，二者共享参数。checkpoint 与 EMA 一律作用于
+        # base_model，避免 state_dict 键带 _orig_mod 前缀导致推理加载失败。
+        self.base_model: nn.Module = build_model(config).to(self.device)
+        if bool(train_cfg.get("compile", False)) and self.device.type == "cuda":
+            self.model: nn.Module = torch.compile(self.base_model)
+        else:
+            self.model = self.base_model
         self.criterion = build_loss(config).to(self.device)
         self.optimizer: Optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            self.base_model.parameters(),
             lr=float(train_cfg.get("lr", 1e-4)),
             weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
         )
@@ -117,10 +124,13 @@ class Trainer:
         # ---- EMA（依赖已创建的模型，须在模型之后初始化） ----
         self.use_ema = bool(train_cfg.get("ema", False))
         self.ema = (
-            ModelEMA(self.model, decay=0.9999, warmup_steps=100)
+            ModelEMA(self.base_model, decay=0.9999, warmup_steps=100)
             if self.use_ema
             else None
         )
+        # EMA 权重每隔 N 个 epoch 才额外评估一次（默认 1 = 每轮都评），
+        # 验证集较大时可显著降低验证开销；最后一轮必定评估。
+        self.ema_eval_every = max(1, int(train_cfg.get("ema_eval_every", 1)))
 
         # ---- 训练状态 ----
         self.start_epoch = 0
@@ -211,7 +221,7 @@ class Trainer:
 
             # EMA 必须在每个优化 step 后更新，与是否启用 AMP 无关。
             if self.ema is not None:
-                self.ema.update(self.model)
+                self.ema.update(self.base_model)
 
             # OneCycleLR 按 batch 步进；cosine 在 fit() 中按 epoch 步进。
             if self.scheduler_type == "onecycle":
@@ -288,10 +298,17 @@ class Trainer:
         for epoch in range(self.start_epoch, self.epochs):
             train_loss = self.train_one_epoch(epoch)
 
-            # 每个 epoch 只验证一次原始权重；启用 EMA 时再补一次 EMA 验证。
+            # 每个 epoch 只验证一次原始权重；EMA 按 ema_eval_every 间隔评估。
             val_metrics = self.validate(use_ema=False)
             weight_source = "raw"
-            if self.ema is not None:
+            should_eval_ema = (
+                self.ema is not None
+                and (
+                    (epoch + 1) % self.ema_eval_every == 0
+                    or epoch + 1 == self.epochs
+                )
+            )
+            if should_eval_ema:
                 ema_metrics = self.validate(use_ema=True)
                 if ema_metrics["score"] > val_metrics["score"]:
                     val_metrics = ema_metrics
@@ -319,7 +336,7 @@ class Trainer:
 
             # 保存最新与最优两份 checkpoint，最优按比赛综合得分判定。
             save_checkpoint(
-                self.model, self.optimizer, epoch + 1, self.best_score,
+                self.base_model, self.optimizer, epoch + 1, self.best_score,
                 self.config, str(self.checkpoint_dir / "last.pth"),
             )
             if val_metrics["score"] > self.best_score:

@@ -8,7 +8,8 @@ data:
   root: data                # 数据根目录（兼容 data/<organ>/train 与 data/train 两种结构）
   marker: CD68              # 目标标记：CD68 / CD45RO / HLA-DR / Vimentin
   split_dir: data/splits    # ROI 划分文件目录（先运行 make_splits）
-  num_workers: 12           # 数据加载进程数（机器 20 核，12 个 worker 喂饱 GPU）
+  num_workers: 12
+  cache: true             # 全部图像预加载到内存，免去每 epoch 重复解码 JPG           # 数据加载进程数（机器 20 核，12 个 worker 喂饱 GPU）
 
 model:
   type: unet                # 见 src/models/registry.py 注册表
@@ -37,6 +38,7 @@ training:
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
   amp: true                 # 混合精度训练（仅 CUDA 生效，显著提速）
+  compile: true             # torch.compile 图优化（仅 CUDA 生效）
 
 inference:
   output_dir: results

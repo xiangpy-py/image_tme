@@ -7,7 +7,8 @@ experiment:
 data:
   root: data
   split_dir: data/splits
-  num_workers: 4
+  num_workers: 8
+  cache: true             # 全部图像预加载到内存，免去每 epoch 重复解码 JPG
 
 model:
   type: adapter_unet
@@ -36,12 +37,14 @@ augmentation:
 
 training:
   epochs: 150
-  batch_size: 16
+  batch_size: 32
   lr: 1.0e-4
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
   ema: true
+  ema_eval_every: 5     # EMA 权重每 5 轮才额外评估一次，降低验证开销
   amp: true
+  compile: false          # torch.compile 图优化（仅 CUDA 生效）
 
 inference:
   output_dir: results
@@ -49,4 +52,5 @@ inference:
 
 runtime:
   device: auto
+  deterministic: false  # 关闭确定性卷积，启用 cuDNN 自动调优
   seed: 42
