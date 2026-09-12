@@ -7,11 +7,13 @@ wheels/
 *.egg-info
 
 .venv
-logs/
-checkpoints/
+/logs/
+/checkpoints/
 .ipynb_checkpoints/
-data/
-assets/
-archify/
-temp/
-old_code/
+/data/
+/assets/
+/archify/
+/temp/
+/old_code/
+
+/data.tar.gz
