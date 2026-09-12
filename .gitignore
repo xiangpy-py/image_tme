@@ -6,11 +6,12 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
 .venv
 logs/
 checkpoints/
 .ipynb_checkpoints/
 data/
-assests/
-archify
+assets/
+archify/
+temp/
+old_code/

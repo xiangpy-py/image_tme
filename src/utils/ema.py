@@ -3,19 +3,14 @@
 训练过程中维护模型权重的滑动平均副本，
 推理时使用 EMA 权重通常能获得更稳定、更泛化的结果。
 
-核心思想：
-    参数更新不是直接采用当前梯度步的值，
-    而是按 ``ema = decay * ema + (1 - decay) * param`` 做平滑，
-    降低优化轨迹中的高频抖动对最终模型的影响。
-
 使用方式：
-    1. 训练前用 ``ema = ModelEMA(model, decay=0.9999)`` 创建
-    2. 每个训练 step 后调用 ``ema.update(model)``
-    3. 验证/推理前调用 ``ema.apply_shadow()`` 将 EMA 权重加载到模型
-    4. 验证/推理后调用 ``ema.restore()`` 恢复原始训练权重
+    1. 训练前用 ``ema = ModelEMA(model, decay=0.9999)`` 创建；
+    2. 每个训练 step 后调用 ``ema.update(model)``；
+    3. 验证/推理前调用 ``ema.apply_shadow(model)`` 将 EMA 权重加载到模型；
+    4. 验证/推理后调用 ``ema.restore(model)`` 恢复原始训练权重。
 """
 
-from typing import Optional
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -47,13 +42,13 @@ class ModelEMA:
         self.warmup_steps = warmup_steps
         self.step_count = 0
 
-        # 仅对可训练参数做 EMA，buffer（如 BN running_mean）不参与
-        self.shadow: dict[str, torch.Tensor] = {}
-        self.backup: dict[str, torch.Tensor] = {}
+        # 仅对可训练参数做 EMA，buffer（如 BN running_mean）不参与。
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
 
         for name, param in model.named_parameters():
             if param.requires_grad:
-                # 深拷贝并脱离计算图，EMA 不参与梯度
+                # 深拷贝并脱离计算图，EMA 不参与梯度。
                 self.shadow[name] = param.data.clone().detach()
 
     def _get_current_decay(self) -> float:
@@ -104,9 +99,7 @@ class ModelEMA:
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if param.requires_grad and name in self.shadow:
-                    # 备份当前训练权重
                     self.backup[name] = param.data.clone()
-                    # 加载 EMA 权重
                     param.data.copy_(self.shadow[name])
 
     def restore(self, model: nn.Module) -> None:
@@ -126,15 +119,15 @@ class ModelEMA:
                     param.data.copy_(self.backup[name])
         self.backup.clear()
 
-    def state_dict(self) -> dict[str, torch.Tensor]:
+    def state_dict(self) -> Dict[str, torch.Tensor]:
         """导出 EMA 状态字典，用于 checkpoint 保存。
 
         Returns:
-            dict[str, torch.Tensor]: EMA 阴影权重的深拷贝。
+            Dict[str, torch.Tensor]: EMA 阴影权重的深拷贝。
         """
-        return {k: v.clone() for k, v in self.shadow.items()}
+        return {key: value.clone() for key, value in self.shadow.items()}
 
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         """从 checkpoint 恢复 EMA 状态。
 
         Args:
@@ -143,4 +136,4 @@ class ModelEMA:
         Returns:
             None
         """
-        self.shadow = {k: v.clone() for k, v in state_dict.items()}
+        self.shadow = {key: value.clone() for key, value in state_dict.items()}

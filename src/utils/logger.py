@@ -1,5 +1,6 @@
-"""日志模块：控制台日志 + 实验记录（CSV / JSON）。
+"""日志与实验记录。
 
+控制台日志 + 逐 epoch 指标记录（CSV / JSON）。
 比赛要求提交结果可复现，因此每次实验都会把
 训练超参数与逐 epoch 指标持久化到 ``logs/`` 目录。
 """
@@ -12,41 +13,45 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
-def setup_logger(name: str, log_file: str = "") -> logging.Logger:
-    """创建同时输出到控制台与文件的 logger。
+class LoggerFactory:
+    """创建同时输出到控制台与文件的 logger。"""
 
-    Args:
-        name:     logger 名称，通常使用入口脚本名。
-        log_file: 日志文件路径，空字符串表示仅输出到控制台。
+    @staticmethod
+    def create(name: str, log_file: str = "") -> logging.Logger:
+        """创建（或复用）指定名称的 logger。
 
-    Returns:
-        logging.Logger: 配置完成的 logger 实例。
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+        Args:
+            name:     logger 名称，通常使用模块或入口名。
+            log_file: 日志文件路径，空字符串表示仅输出到控制台。
 
-    # 避免重复添加 handler（例如在交互式环境中多次调用）。
-    if logger.handlers:
+        Returns:
+            logging.Logger: 配置完成的 logger 实例。
+        """
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        # 避免重复添加 handler（例如在交互式环境中多次调用）。
+        if logger.handlers:
+            return logger
+
+        formatter = logging.Formatter(
+            fmt="[%(asctime)s][%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        if log_file:
+            path = Path(log_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(path, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
         return logger
-
-    formatter = logging.Formatter(
-        fmt="[%(asctime)s][%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    if log_file:
-        path = Path(log_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(path, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-    return logger
 
 
 class ExperimentLogger:
@@ -60,7 +65,7 @@ class ExperimentLogger:
     """
 
     def __init__(self, log_dir: str, fieldnames: List[str]) -> None:
-        """初始化实验记录器并创建 CSV 表头。
+        """初始化记录器并创建 CSV 表头。
 
         Args:
             log_dir:    本次实验的日志目录。
@@ -75,8 +80,7 @@ class ExperimentLogger:
         self._records: List[Dict[str, Any]] = []
 
         with open(self.csv_path, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
+            csv.DictWriter(file, fieldnames=fieldnames).writeheader()
 
     def log(self, record: Dict[str, Any]) -> None:
         """追加一条记录（通常对应一个 epoch）。
@@ -91,10 +95,13 @@ class ExperimentLogger:
         self._records.append(row)
 
         with open(self.csv_path, "a", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=self._fieldnames)
-            writer.writerow(row)
+            csv.DictWriter(file, fieldnames=self._fieldnames).writerow(row)
 
     def finish(self) -> None:
-        """将全部记录汇总写入 JSON 文件，便于后续分析脚本读取。"""
+        """把全部记录汇总写入 JSON，便于后续分析。
+
+        Returns:
+            None
+        """
         with open(self.json_path, "w", encoding="utf-8") as file:
             json.dump(self._records, file, ensure_ascii=False, indent=2)

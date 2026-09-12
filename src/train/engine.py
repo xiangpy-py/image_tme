@@ -1,0 +1,648 @@
+"""训练与推理引擎。
+
+- ``Trainer``：单配置实验的完整生命周期（数据 -> 模型 -> 训练 -> 验证 ->
+  保存 checkpoint），支持 AMP 混合精度、EMA 权重滑动平均与 torch.compile；
+- ``Predictor``：checkpoint 查找/加载与测试集批量推理，输出按比赛提交规范
+  组织为 ``results/test/<MARKER>/<原名>_fake.jpg``。
+
+兼容单标记模型与多标记条件模型（按模型类型决定是否传入 ``marker_idx``）。
+"""
+
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from ..data.constants import MARKERS, sanitize_marker_name
+from ..utils import (
+    CheckpointManager,
+    ExperimentLogger,
+    LoggerFactory,
+    ModelEMA,
+    Runtime,
+)
+from .data import DataLoaders
+from .losses import CombinedLoss
+from .metrics import AverageMeter, MetricAccumulator
+from .models import ModelRegistry
+
+
+class Trainer:
+    """训练器：驱动单配置实验的完整生命周期。"""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """按配置初始化训练所需的全部组件。
+
+        Args:
+            config: 全局配置字典（已合并命令行覆盖项）。
+        """
+        self.config = config
+        train_cfg = config.get("training", {})
+        runtime_cfg = config.get("runtime", {})
+
+        Runtime.seed_everything(int(runtime_cfg.get("seed", 42)))
+        self.device = Runtime.get_device(runtime_cfg.get("device"))
+
+        # ---- 计算加速配置 ----
+        self.use_amp = bool(train_cfg.get("amp", False)) and self.device.type == "cuda"
+        self.scaler = (
+            torch.amp.GradScaler("cuda", enabled=self.use_amp)
+            if self.device.type == "cuda"
+            else None
+        )
+        if self.device.type == "cpu":
+            num_threads = int(runtime_cfg.get("num_threads", 0))
+            if num_threads > 0:
+                torch.set_num_threads(num_threads)
+        elif not bool(runtime_cfg.get("deterministic", True)):
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+
+        self.experiment_name = config.get("experiment", {}).get("name", "exp")
+        self.log_dir = Path("logs") / self.experiment_name
+        self.checkpoint_dir = Path("checkpoints") / self.experiment_name
+        self.logger = LoggerFactory.create("trainer", str(self.log_dir / "train.log"))
+
+        self.epochs = int(train_cfg.get("epochs", 100))
+        self.conditional = ModelRegistry.is_conditional(config)
+
+        # ---- 数据 ----
+        loaders = DataLoaders.build(config)
+        self.train_loader: DataLoader = loaders["train"]
+        self.val_loader: DataLoader = loaders["val"]
+
+        # ---- 模型 / 损失 / 优化器 ----
+        # base_model: 原始模型，用于 checkpoint 与 EMA（避免 compile 的 _orig_mod 前缀）。
+        # model:      实际前向用的模型，可能是 torch.compile 包装后的版本。
+        self.base_model: nn.Module = ModelRegistry.build(config).to(self.device)
+
+        self.compile_mode: Optional[str] = None
+        if bool(train_cfg.get("compile", False)) and self.device.type == "cuda":
+            self.compile_mode = str(train_cfg.get("compile_mode", "default"))
+            self.logger.info(f"torch.compile 模式: {self.compile_mode}")
+            # 屏蔽 Inductor 首轮内核调优刷屏与弃用警告，仅影响日志输出。
+            from torch._inductor import config as inductor_config
+
+            inductor_config.autotune_num_choices_displayed = 0
+            inductor_config.max_autotune_report_choices_stats = False
+            warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
+            self.model: nn.Module = torch.compile(
+                self.base_model,
+                mode=self.compile_mode,
+                fullgraph=False,
+                dynamic=False,
+            )
+        else:
+            self.model = self.base_model
+
+        self.criterion = CombinedLoss.from_config(config).to(self.device)
+        self.optimizer: Optimizer = torch.optim.AdamW(
+            self.base_model.parameters(),
+            lr=float(train_cfg.get("lr", 1e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
+        )
+
+        # ---- 学习率调度器 ----
+        self.scheduler_type = str(train_cfg.get("scheduler", "cosine"))
+        if self.scheduler_type == "onecycle":
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=float(train_cfg.get("lr", 1e-4)),
+                total_steps=self.epochs * len(self.train_loader),
+                pct_start=0.3,
+                div_factor=25.0,
+                final_div_factor=1e4,
+            )
+        else:
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.epochs,
+                eta_min=float(train_cfg.get("min_lr", 1e-6)),
+            )
+
+        # ---- EMA ----
+        self.use_ema = bool(train_cfg.get("ema", False))
+        self.ema = (
+            ModelEMA(self.base_model, decay=0.9999, warmup_steps=100)
+            if self.use_ema
+            else None
+        )
+        # EMA 每隔 N 个 epoch 才额外评估一次，验证集较大时可显著降低开销。
+        self.ema_eval_every = max(1, int(train_cfg.get("ema_eval_every", 1)))
+
+        # ---- 训练状态 ----
+        self.best_score = 0.0
+        self.recorder = ExperimentLogger(
+            str(self.log_dir),
+            fieldnames=[
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "val_ssim",
+                "val_psnr",
+                "val_score",
+                "lr",
+            ],
+        )
+
+        self.logger.info(
+            f"实验 [{self.experiment_name}] 初始化完成 | "
+            f"设备: {self.device} | 训练样本: {len(self.train_loader.dataset)} | "
+            f"验证样本: {len(self.val_loader.dataset)}"
+            + (" | AMP: 开" if self.use_amp else "")
+            + (" | EMA: 开" if self.use_ema else "")
+            + (f" | Compile: {self.compile_mode}" if self.compile_mode else "")
+        )
+
+    # ------------------------------------------------------------------ #
+    # 前向与验证
+    # ------------------------------------------------------------------ #
+    def _forward(
+        self, batch: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        """根据模型类型执行前向传播。
+
+        Args:
+            batch: DataLoader 输出的批次字典。
+
+        Returns:
+            Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+                (预测, 辅助信息)。模型返回元组时打包进 aux 供损失使用。
+        """
+        inputs = batch["input"].to(self.device, non_blocking=True)
+        if not self.conditional:
+            return self.model(inputs), None
+
+        marker_idx = batch["marker_idx"].to(self.device, non_blocking=True)
+        output = self.model(inputs, marker_idx)
+        if isinstance(output, tuple):
+            return output[0], {"shared_features": output[1], "marker_idx": marker_idx}
+        return output, None
+
+    def train_one_epoch(self, epoch: int) -> float:
+        """训练一个 epoch。
+
+        Args:
+            epoch: 当前轮次（从 0 开始）。
+
+        Returns:
+            float: 本 epoch 的训练平均损失。
+        """
+        self.model.train()
+        loss_meter = AverageMeter()
+
+        progress = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch + 1}/{self.epochs} [train]",
+            leave=False,
+        )
+        for batch in progress:
+            targets = batch["target"].to(self.device, non_blocking=True)
+
+            self.optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp
+            ):
+                predictions, aux = self._forward(batch)
+
+            # 损失计算放到 autocast 之外并强制 fp32：
+            # SSIM 中的相近数相减在 fp16 下会灾难性抵消，导致 loss=NaN。
+            loss, _details = self.criterion(predictions.float(), targets, aux=aux)
+
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
+
+            # EMA 更新必须基于 base_model（与 compile 包装无关）。
+            if self.ema is not None:
+                self.ema.update(self.base_model)
+            if self.scheduler_type == "onecycle":
+                self.scheduler.step()
+
+            loss_meter.update(float(loss.detach()), predictions.shape[0])
+            progress.set_postfix(loss=f"{loss_meter.avg:.4f}")
+        return loss_meter.avg
+
+    def validate(self, use_ema: bool = False) -> Dict[str, float]:
+        """在验证集上评估模型，可选择临时切换为 EMA 权重。
+
+        Args:
+            use_ema: 是否用 EMA 阴影权重评估（评估后自动恢复训练权重）。
+
+        Returns:
+            Dict[str, float]: 含 ``loss`` / ``ssim`` / ``psnr`` / ``score``。
+        """
+        if use_ema and self.ema is not None:
+            # 阴影权重必须施加到 base_model：compile 包装后的模型参数名带
+            # _orig_mod. 前缀，与 EMA 的 shadow 键（基于 base_model 建立）不匹配，
+            # 会导致切换静默失效。base_model 与 compile 版本共享同一批参数张量，
+            # 原地写入即可被前向传播感知。
+            self.ema.apply_shadow(self.base_model)
+            metrics = self._validate_impl()
+            self.ema.restore(self.base_model)
+            return metrics
+        return self._validate_impl()
+
+    @torch.no_grad()
+    def _validate_impl(self) -> Dict[str, float]:
+        """验证实现：遍历验证集累计指标（不用 tqdm，避免 CPU 阻塞 GPU）。
+
+        Returns:
+            Dict[str, float]: 含 ``loss`` / ``ssim`` / ``psnr`` / ``score``。
+        """
+        self.model.eval()
+        loss_meter = AverageMeter()
+        accumulator = MetricAccumulator()
+
+        for batch in self.val_loader:
+            targets = batch["target"].to(self.device, non_blocking=True)
+            with torch.autocast(
+                device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp
+            ):
+                predictions, aux = self._forward(batch)
+
+            # 与训练一致：损失在 fp32 下计算，避免 fp16 数值不稳定。
+            loss, _details = self.criterion(predictions.float(), targets, aux=aux)
+            loss_meter.update(float(loss), predictions.shape[0])
+            accumulator.update(predictions.float(), targets.float())
+
+        metrics = accumulator.compute()
+        metrics["loss"] = loss_meter.avg
+        return metrics
+
+    # ------------------------------------------------------------------ #
+    # 主流程
+    # ------------------------------------------------------------------ #
+    def fit(self) -> float:
+        """执行完整训练流程，逐 epoch 训练、验证并保存最优模型。
+
+        Returns:
+            float: 训练过程中的最优验证综合得分。
+        """
+        self.logger.info(f"开始训练，共 {self.epochs} 个 epoch")
+        start_time = time.time()
+
+        for epoch in range(self.epochs):
+            train_loss = self.train_one_epoch(epoch)
+
+            # 每个 epoch 验证原始权重；EMA 按 ema_eval_every 间隔评估。
+            val_metrics = self.validate(use_ema=False)
+            weight_source = "raw"
+            should_eval_ema = self.ema is not None and (
+                (epoch + 1) % self.ema_eval_every == 0 or epoch + 1 == self.epochs
+            )
+            if should_eval_ema:
+                ema_metrics = self.validate(use_ema=True)
+                if ema_metrics["score"] > val_metrics["score"]:
+                    val_metrics = ema_metrics
+                    weight_source = "ema"
+
+            if self.scheduler_type != "onecycle":
+                self.scheduler.step()
+
+            self.recorder.log(
+                {
+                    "epoch": epoch + 1,
+                    "train_loss": f"{train_loss:.6f}",
+                    "val_loss": f"{val_metrics['loss']:.6f}",
+                    "val_ssim": f"{val_metrics['ssim']:.6f}",
+                    "val_psnr": f"{val_metrics['psnr']:.4f}",
+                    "val_score": f"{val_metrics['score']:.6f}",
+                    "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                }
+            )
+            self.logger.info(
+                f"Epoch {epoch + 1}/{self.epochs} | "
+                f"train_loss={train_loss:.4f} | val_loss={val_metrics['loss']:.4f} | "
+                f"SSIM={val_metrics['ssim']:.4f} | PSNR={val_metrics['psnr']:.2f} | "
+                f"Score={val_metrics['score']:.4f} | 权重来源={weight_source}"
+            )
+
+            # 保存 checkpoint：始终基于 base_model，避免 _orig_mod 前缀。
+            CheckpointManager.save(
+                self.base_model,
+                self.optimizer,
+                epoch + 1,
+                self.best_score,
+                self.config,
+                str(self.checkpoint_dir / "last.pth"),
+            )
+            if val_metrics["score"] > self.best_score:
+                self.best_score = val_metrics["score"]
+                self._save_best(epoch, weight_source)
+
+        self.recorder.finish()
+        self.logger.info(
+            f"训练完成，耗时 {(time.time() - start_time) / 60:.1f} 分钟，"
+            f"最优 Score={self.best_score:.4f}"
+        )
+        return self.best_score
+
+    def _save_best(self, epoch: int, weight_source: str) -> None:
+        """保存最优 checkpoint，EMA 更优时保存 EMA 阴影权重。
+
+        Args:
+            epoch:         当前轮次（从 0 开始）。
+            weight_source: 最优权重来源，``"raw"`` 或 ``"ema"``。
+
+        Returns:
+            None
+        """
+        restore_after = weight_source == "ema" and self.ema is not None
+        if restore_after:
+            # 同上：EMA 阴影施加/还原统一作用于 base_model。
+            self.ema.apply_shadow(self.base_model)
+
+        CheckpointManager.save(
+            self.base_model,
+            self.optimizer,
+            epoch + 1,
+            self.best_score,
+            self.config,
+            str(self.checkpoint_dir / "best.pth"),
+        )
+
+        if restore_after:
+            self.ema.restore(self.base_model)
+        self.logger.info(
+            f"  -> 新的最优模型 (Score={self.best_score:.4f}, 来源={weight_source})"
+        )
+
+
+class Predictor:
+    """预测器：checkpoint 查找/加载与测试集结果生成。"""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """初始化设备、模型与测试集加载器。
+
+        Args:
+            config: 全局配置字典。
+        """
+        self.config = config
+        self.device = Runtime.get_device(config.get("runtime", {}).get("device"))
+        self.logger = LoggerFactory.create("predictor")
+        self.conditional = ModelRegistry.is_conditional(config)
+
+        self.model: nn.Module = ModelRegistry.build(config).to(self.device)
+        self.test_loader = DataLoaders.for_test(config)
+
+        inference_cfg = config.get("inference", {})
+        self.output_root = str(inference_cfg.get("output_dir", "results"))
+        self.suffix = str(inference_cfg.get("suffix", "_fake"))
+
+    # ------------------------------------------------------------------ #
+    # 静态工具
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def unpack(output: Any) -> torch.Tensor:
+        """解包模型输出，兼容返回 (预测, 共享特征) 元组的模型。
+
+        Args:
+            output: 模型前向输出，张量或元组。
+
+        Returns:
+            torch.Tensor: 预测图像 ``(B, C, H, W)``。
+        """
+        return output[0] if isinstance(output, tuple) else output
+
+    @staticmethod
+    def save_batch(
+        predictions: torch.Tensor,
+        names: List[str],
+        marker: str,
+        output_root: str = "results",
+        suffix: str = "_fake",
+    ) -> None:
+        """把一个 batch 的预测按比赛命名规范保存为 JPG。
+
+        输出路径为 ``<output_root>/test/<MARKER>/<原名><suffix>.jpg``。
+
+        Args:
+            predictions: 预测张量 ``(B, C, H, W)``，取值 ``[0, 1]``。
+            names:       每个样本的文件名（不含后缀）。
+            marker:      目标标记名，决定输出子目录。
+            output_root: 结果根目录。
+            suffix:      输出文件名后缀。
+
+        Returns:
+            None
+        """
+        output_dir = Path(output_root) / "test" / marker
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for prediction, name in zip(predictions, names):
+            array = prediction.detach().cpu().clamp(0.0, 1.0).numpy()
+            array = np.transpose(array, (1, 2, 0))  # CHW -> HWC
+            array = (array * 255.0).round().astype(np.uint8)
+
+            # 统一输出三通道 JPG：目标真值为灰度强度图但以 3 通道 JPG 存储
+            # （三通道完全相同）。提交三通道可同时兼容按灰度或按 RGB 读取的
+            # 评测脚本，且 SSIM/PSNR 数值与单通道完全一致。
+            if array.shape[-1] == 1:
+                array = np.repeat(array, 3, axis=-1)
+            cv2.imwrite(
+                str(output_dir / f"{name}{suffix}.jpg"),
+                cv2.cvtColor(array, cv2.COLOR_RGB2BGR),
+            )
+
+    @staticmethod
+    def find_checkpoints(
+        experiment: str, conditional: bool, checkpoint_root: str = "checkpoints"
+    ) -> Dict[str, str]:
+        """按命名约定自动收集实验对应的全部 checkpoint。
+
+        权重查找约定（与训练命名规则一致）：
+
+        - 单标记模型: ``checkpoints/<实验名>_<标记名小写>/best.pth``
+        - 条件模型:   ``checkpoints/<实验名>/best.pth``
+
+        Args:
+            experiment:      实验名（训练配置中的 ``experiment.name``）。
+            conditional:     是否为多标记条件模型。
+            checkpoint_root: checkpoint 根目录。
+
+        Returns:
+            Dict[str, str]: ``{标记名: checkpoint路径}``；条件模型用键 ``"all"``。
+
+        Raises:
+            FileNotFoundError: 任一必需的 checkpoint 不存在时抛出。
+        """
+        root = Path(checkpoint_root)
+        if conditional:
+            path = root / experiment / "best.pth"
+            if not path.is_file():
+                raise FileNotFoundError(f"未找到条件模型 checkpoint: {path}")
+            return {"all": str(path)}
+
+        checkpoints: Dict[str, str] = {}
+        missing: List[str] = []
+        for marker in MARKERS:
+            path = root / f"{experiment}_{sanitize_marker_name(marker)}" / "best.pth"
+            if path.is_file():
+                checkpoints[marker] = str(path)
+            else:
+                missing.append(str(path))
+
+        if missing:
+            raise FileNotFoundError(
+                "以下标记的 checkpoint 缺失，请先完成对应训练:\n  "
+                + "\n  ".join(missing)
+            )
+        return checkpoints
+
+    @classmethod
+    def resolve_checkpoints(
+        cls,
+        experiment: Optional[str],
+        conditional: bool,
+        overrides: Optional[Dict[str, str]] = None,
+        checkpoint_root: str = "checkpoints",
+    ) -> Dict[str, str]:
+        """汇总推理所需的 checkpoint 路径。
+
+        ``overrides`` 中手动指定的路径优先于按实验名自动查找的结果，
+        因此可与 ``experiment`` 混用作为补充或覆盖。
+
+        Args:
+            experiment:      实验名；``None`` 表示不按实验名自动查找。
+            conditional:     是否为多标记条件模型。
+            overrides:       ``{标记名: checkpoint路径}`` 手动覆盖项。
+            checkpoint_root: checkpoint 根目录。
+
+        Returns:
+            Dict[str, str]: ``{标记名: checkpoint路径}``；条件模型用键 ``"all"``。
+
+        Raises:
+            ValueError: 既没有实验名也没有任何手动覆盖项时抛出。
+        """
+        checkpoint_paths: Dict[str, str] = {}
+        if experiment is not None:
+            checkpoint_paths = cls.find_checkpoints(
+                experiment, conditional, checkpoint_root
+            )
+        checkpoint_paths.update(overrides or {})
+
+        if not checkpoint_paths:
+            raise ValueError("请提供实验名或至少一个 checkpoint 覆盖项")
+        return checkpoint_paths
+
+    @classmethod
+    def run_experiment(
+        cls,
+        config: Dict[str, Any],
+        experiment: Optional[str] = None,
+        overrides: Optional[Dict[str, str]] = None,
+        checkpoint_root: str = "checkpoints",
+    ) -> None:
+        """推理入口：汇总 checkpoint 并在测试集上批量生成提交结果。
+
+        Args:
+            config:          全局配置字典。
+            experiment:      实验名，按命名约定自动查找全部标记的权重。
+            overrides:       ``{标记名: checkpoint路径}`` 手动覆盖项。
+            checkpoint_root: checkpoint 根目录。
+
+        Returns:
+            None
+        """
+        checkpoint_paths = cls.resolve_checkpoints(
+            experiment, ModelRegistry.is_conditional(config), overrides, checkpoint_root
+        )
+        cls(config).run(checkpoint_paths)
+
+    # ------------------------------------------------------------------ #
+    # 推理流程
+    # ------------------------------------------------------------------ #
+    def _load_weights(self, checkpoint_path: str) -> None:
+        """加载模型权重并切换为评估模式。
+
+        Args:
+            checkpoint_path: checkpoint 文件路径。
+
+        Returns:
+            None
+        """
+        info = CheckpointManager.load(checkpoint_path, self.model, map_location="cpu")
+        self.model.to(self.device).eval()
+        self.logger.info(
+            f"已加载 {checkpoint_path} (epoch={info['epoch']}, "
+            f"best_score={info['best_score']:.4f})"
+        )
+
+    @torch.no_grad()
+    def run_single_marker(self, marker: str, checkpoint_path: str) -> None:
+        """用单标记模型生成一种标记的全部测试结果。
+
+        Args:
+            marker:          目标标记名。
+            checkpoint_path: 该标记对应的模型 checkpoint。
+
+        Returns:
+            None
+        """
+        self._load_weights(checkpoint_path)
+        for batch in tqdm(self.test_loader, desc=f"infer [{marker}]"):
+            predictions = self.unpack(self.model(batch["input"].to(self.device)))
+            self.save_batch(
+                predictions, batch["name"], marker, self.output_root, self.suffix
+            )
+
+    @torch.no_grad()
+    def run_multi_marker(self, checkpoint_path: str) -> None:
+        """用多标记条件模型一次性生成全部四种标记的结果。
+
+        Args:
+            checkpoint_path: 条件模型 checkpoint。
+
+        Returns:
+            None
+        """
+        self._load_weights(checkpoint_path)
+        for marker_idx, marker in enumerate(MARKERS):
+            for batch in tqdm(self.test_loader, desc=f"infer [{marker}]"):
+                inputs = batch["input"].to(self.device)
+                idx_tensor = torch.full(
+                    (inputs.shape[0],), marker_idx, dtype=torch.long, device=self.device
+                )
+                predictions = self.unpack(self.model(inputs, idx_tensor))
+                self.save_batch(
+                    predictions, batch["name"], marker, self.output_root, self.suffix
+                )
+
+    def run(self, checkpoint_paths: Dict[str, str]) -> None:
+        """推理分发：按模型类型走单标记或多标记流程。
+
+        Args:
+            checkpoint_paths: ``{标记名: checkpoint路径}``；
+                多标记模式约定使用键 ``"all"``。
+
+        Returns:
+            None
+
+        Raises:
+            KeyError: 缺少所需 checkpoint 键时抛出。
+        """
+        if self.conditional:
+            if "all" not in checkpoint_paths:
+                raise KeyError("多标记模式需要提供 {'all': checkpoint路径}")
+            self.run_multi_marker(checkpoint_paths["all"])
+        else:
+            for marker in MARKERS:
+                if marker not in checkpoint_paths:
+                    raise KeyError(f"缺少标记 {marker} 的 checkpoint 路径")
+                self.run_single_marker(marker, checkpoint_paths[marker])
+
+        self.logger.info(f"推理完成，结果保存于 {self.output_root}/test/")

@@ -1,76 +1,88 @@
-# 实验矩阵：赛马制「短实验筛选 -> 长训练冲刺」两阶段配置
+# 实验矩阵（参数搜索）：以复合模型（一对多条件模型）为主力，
+# 在固定骨干上搜索更优的训练超参数，而不是横向更换网络结构。
 #
-# 策略（对应赛马制打法）：
-#   1. screening：每个实验只跑少量 epoch，用统一代理标记横向比较，
-#      快速淘汰明显不行的组合；
-#   2. full：取 screening 排行榜 Top-K 进入完整训练；
-#      单标记模型此时依次训练全部四种标记，条件模型一次训练覆盖。
+# 设计依据：
+#   1. 复合模型一次训练覆盖四类标记，属于赛题「一对多联合建模」加分方向，
+#      且覆盖全部标记的总耗时显著低于「每标记各训一个模型」；
+#   2. 历史数据里各架构都挤压在 0.67~0.69 的窄带内，
+#      继续换结构的边际收益低、且差异被单次划分的噪声淹没，
+#      真正值得投入的是损失权重 / 学习率 / 容量 / 增广这些参数；
+#   3. 固定一个复合骨干（conditional_unet_v2，多尺度 FiLM 条件注入），
+#      参照组 + 单变量覆盖，保证筛选阶段的可比性。
 #
 # 用法：
-#   uv run image-tme experiments --matrix configs/experiment_matrix.yaml --stage screening
-#   uv run image-tme experiments --matrix configs/experiment_matrix.yaml --stage full
-#   uv run image-tme experiments --matrix configs/experiment_matrix.yaml --stage report
+#   uv run main.py experiments --matrix configs/experiment_matrix.yaml --stage screening
+#   uv run main.py experiments --matrix configs/experiment_matrix.yaml --stage report
+#   uv run main.py experiments --matrix configs/experiment_matrix.yaml --stage full
+#
+# 前置：先执行 `uv run main.py split --root data --val-ratio 0.15` 生成划分文件。
 
 screening:
   epochs: 15            # 短实验轮数：足以拉开差距，又不浪费算力
-  marker: CD68          # 代理标记：单标记模型筛选阶段统一只训它，控制变量
+  marker: CD68          # 仅单标记模型使用；本矩阵全为复合模型，该字段不生效
 
 full:
   epochs: 100           # 长训练轮数
-  top_k: 4              # 进入长训练的实验数
+  top_k: 3              # 进入长训练的实验数
 
-# 每个实验 = base 配置 + overrides 局部覆盖（递归合并）。
+# 每个实验 = 固定骨干 configs/conditional_v2.yaml + overrides 单变量覆盖（递归合并）。
 # name 会写入 experiment.name；screening 阶段自动追加 _screen 后缀。
 experiments:
-  # ---- 第一梯队：CNN 编码器-解码器 ----
-  - name: exp101_unet_l1
-    base: configs/baseline.yaml
-    overrides:
-      model: {type: unet}
-      loss: {lambda_l1: 1.0, lambda_ssim: 0.0}
+  # ---- 参照组：骨干默认参数 ----
+  - name: p00_cond_v2_ref
+    base: configs/conditional_v2.yaml
 
-  - name: exp102_unet_l1_ssim
-    base: configs/baseline.yaml
-    overrides:
-      model: {type: unet}
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
-
-  - name: exp103_resunet_l1_ssim
-    base: configs/baseline.yaml
-    overrides:
-      model: {type: resnet_unet, backbone: resnet34, pretrained: true}
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
-
-  - name: exp104_resunet_l1_ssim_edge
-    base: configs/baseline.yaml
-    overrides:
-      model: {type: resnet_unet, backbone: resnet34, pretrained: true}
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.5}
-
-  # ---- 第二梯队：Transformer 瓶颈 ----
-  - name: exp105_transunet_l1_ssim
-    base: configs/transformer.yaml
-    overrides:
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
-
-  # ---- 一对多联合建模（创新加分方向） ----
-  - name: exp106_cond_unet
-    base: configs/multi_marker.yaml
-    overrides:
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0}
-
-  - name: exp107_cond_v2_film
+  # ---- 学习率 ----
+  - name: p01_lr_5e5
     base: configs/conditional_v2.yaml
     overrides:
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.5}
+      training: {lr: 5.0e-5}
 
-  - name: exp108_adapter_cross
-    base: configs/adapter_unet.yaml
-    overrides:
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.5, lambda_cross: 0.1}
-
-  # ---- 损失权重消融（以最强结构为基准微调） ----
-  - name: exp109_cond_v2_no_edge
+  - name: p02_lr_2e4
     base: configs/conditional_v2.yaml
     overrides:
-      loss: {lambda_l1: 1.0, lambda_ssim: 1.0, lambda_edge: 0.0}
+      training: {lr: 2.0e-4}
+
+  # ---- 批大小 ----
+  - name: p03_batch16
+    base: configs/conditional_v2.yaml
+    overrides:
+      training: {batch_size: 16}
+
+  - name: p04_batch64
+    base: configs/conditional_v2.yaml
+    overrides:
+      training: {batch_size: 64}
+
+  # ---- 损失权重 ----
+  - name: p05_ssim2
+    base: configs/conditional_v2.yaml
+    overrides:
+      loss: {lambda_ssim: 2.0}
+
+  - name: p06_edge0
+    base: configs/conditional_v2.yaml
+    overrides:
+      loss: {lambda_edge: 0.0}
+
+  - name: p07_edge1
+    base: configs/conditional_v2.yaml
+    overrides:
+      loss: {lambda_edge: 1.0}
+
+  # ---- 模型容量 ----
+  - name: p08_embed256
+    base: configs/conditional_v2.yaml
+    overrides:
+      model: {embed_dim: 256}
+
+  - name: p09_basech96
+    base: configs/conditional_v2.yaml
+    overrides:
+      model: {base_channels: 96}
+
+  # ---- 增广强度：关闭光度扰动，仅保留几何增广 ----
+  - name: p10_aug_geoonly
+    base: configs/conditional_v2.yaml
+    overrides:
+      augmentation: {brightness: 0.0, contrast: 0.0, noise_std: 0.0}

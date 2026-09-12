@@ -1,29 +1,20 @@
-"""通用工具子包：配置、日志、随机性控制、checkpoint 与可视化。"""
+"""通用工具链：配置、日志、checkpoint、EMA 与运行环境。
 
-from .config import (
-    build_marker_config,
-    deep_merge,
-    load_config,
-    merge_config_with_args,
-    save_config,
-)
-from .common import AverageMeter, get_device, seed_everything
-from .logger import ExperimentLogger, setup_logger
-from .checkpoint import load_checkpoint, save_checkpoint
-from .visualize import save_comparison_grid
+本子包是跨模块的基础设施层，只依赖标准库与第三方库，
+不反向依赖 ``data`` / ``train`` / 编排层，以保证任意层级都能安全复用。
+"""
+
+from .checkpoint import CheckpointManager
+from .config import ConfigManager
+from .ema import ModelEMA
+from .logger import ExperimentLogger, LoggerFactory
+from .runtime import Runtime
 
 __all__ = [
-    "load_config",
-    "merge_config_with_args",
-    "save_config",
-    "deep_merge",
-    "build_marker_config",
-    "AverageMeter",
-    "get_device",
-    "seed_everything",
+    "ConfigManager",
+    "Runtime",
+    "LoggerFactory",
     "ExperimentLogger",
-    "setup_logger",
-    "load_checkpoint",
-    "save_checkpoint",
-    "save_comparison_grid",
+    "CheckpointManager",
+    "ModelEMA",
 ]

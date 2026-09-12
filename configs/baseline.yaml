@@ -1,18 +1,18 @@
-# Experiment 001: U-Net Baseline
-# 目标：验证数据 -> 训练 -> 验证 -> 推理的完整 pipeline。
+# 实验 001：U-Net 基线
+# 目标：验证「数据 -> 训练 -> 验证 -> 推理」完整链路。
 
 experiment:
   name: exp001_unet_baseline
 
 data:
-  root: data                # 数据根目录（兼容 data/<organ>/train 与 data/train 两种结构）
-  marker: CD68              # 目标标记：CD68 / CD45RO / HLA-DR / Vimentin
-  split_dir: data/splits    # ROI 划分文件目录（先运行 make_splits）
-  num_workers: 12
-  cache: true             # 全部图像预加载到内存，免去每 epoch 重复解码 JPG           # 数据加载进程数（机器 20 核，12 个 worker 喂饱 GPU）
+  root: data              # 数据根目录，兼容 data/train 与 data/<organ>/train
+  marker: CD68            # 单标记目标：CD68 / CD45RO / HLA-DR / Vimentin
+  split_dir: data/splits  # ROI 划分目录，先执行: uv run main.py split
+  num_workers: 12         # 数据加载进程数，留空按 CPU 核心数自动探测
+  cache: true             # 内存缓存解码图像，免去每 epoch 重复解码 JPG
 
 model:
-  type: unet                # 见 src/models/registry.py 注册表
+  type: unet              # 可选值见 src/train/models.py 的 ModelRegistry
   in_channels: 3
   out_channels: 1
   base_channels: 64
@@ -21,7 +21,6 @@ model:
 loss:
   lambda_l1: 1.0
   lambda_ssim: 1.0
-  lambda_perceptual: 0.0    # 基线阶段关闭感知损失
 
 augmentation:
   hflip_prob: 0.5
@@ -33,18 +32,18 @@ augmentation:
 
 training:
   epochs: 100
-  batch_size: 64            # 显存充足（48GB 仅用 4GB），加大 batch 摊薄每步固定开销
+  batch_size: 64
   lr: 1.0e-4
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
-  amp: true                 # 混合精度训练（仅 CUDA 生效，显著提速）
-  compile: true             # torch.compile 图优化（仅 CUDA 生效）
+  amp: true               # 混合精度，仅 CUDA 生效
+  compile: true           # torch.compile 图优化，仅 CUDA 生效
 
 inference:
   output_dir: results
   suffix: _fake
 
 runtime:
-  device: auto              # auto / cpu / cuda / cuda:0
+  device: auto            # auto / cpu / cuda / cuda:0
   seed: 42
-  deterministic: false      # 关闭确定性卷积，启用 cuDNN 自动调优（固定 256x256 输入提速显著）
+  deterministic: false    # false 启用 cuDNN 自动调优，训练更快

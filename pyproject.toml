@@ -1,7 +1,7 @@
 [project]
 name = "image-tme"
 version = "0.1.0"
-description = "人智算法大赛"
+description = "人智算法大赛：基于虚拟染色的免疫组化图像生成"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,13 +15,10 @@ dependencies = [
     "tqdm>=4.70.0",
 ]
 
-[project.scripts]
-image-tme = "image_tme:main"
+# 本项目是「应用」而非「可安装库」：不构建/安装自身，依赖统一交给 uv 管理。
+[tool.uv]
+package = false
 
 [[tool.uv.index]]
 url = "https://pypi.mirrors.ustc.edu.cn/simple/"
 default = true
-
-[build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"

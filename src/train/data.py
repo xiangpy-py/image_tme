@@ -1,0 +1,588 @@
+"""训练侧数据：配对增强、数据集与 DataLoader 构建。
+
+只放「服务于模型训练」的数据组件；通用的图像发现/读取、ROI 划分与
+数据统计等与训练无关的能力位于 ``src.data``。
+
+- ``PairedTransform``：几何变换对输入与真值同步施加，光度扰动仅作用于输入；
+- ``VirtualStainingDataset``：单标记配对数据集（DAPI -> 指定 IHC 标记）；
+- ``MultiMarkerDataset``：一对多数据集，每次随机采样一个目标标记；
+- ``DataLoaders``：训练/验证/测试 DataLoader 的调优构建。
+"""
+
+import os
+import random
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from ..data.constants import MARKERS, SOURCE_MARKER
+from ..data.dataset import DatasetSource, DatasetSplitter
+from .models import ModelRegistry
+
+
+# ------------------------------------------------------------------ #
+# 数据增强
+# ------------------------------------------------------------------ #
+class PairedTransform:
+    """对 (input, target) 图像对执行同步随机增强。
+
+    输入约定为 HWC 布局的 float32 数组，取值范围 ``[0, 1]``。
+    验证/测试阶段使用 ``train=False``，不做任何随机变换。
+    """
+
+    def __init__(
+        self,
+        train: bool = True,
+        hflip_prob: float = 0.5,
+        vflip_prob: float = 0.5,
+        rotate90: bool = True,
+        brightness: float = 0.1,
+        contrast: float = 0.1,
+        noise_std: float = 0.01,
+    ) -> None:
+        """初始化增强参数。
+
+        Args:
+            train:       是否启用随机增强（验证/测试时为 ``False``）。
+            hflip_prob:  水平翻转概率。
+            vflip_prob:  垂直翻转概率。
+            rotate90:    是否启用随机 90 度倍数旋转（病理图像无方向先验）。
+            brightness:  亮度扰动幅度，0 表示关闭。
+            contrast:    对比度扰动幅度，0 表示关闭。
+            noise_std:   高斯噪声标准差，0 表示关闭。
+        """
+        self.train = train
+        self.hflip_prob = hflip_prob
+        self.vflip_prob = vflip_prob
+        self.rotate90 = rotate90
+        self.brightness = brightness
+        self.contrast = contrast
+        self.noise_std = noise_std
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any], train: bool) -> "PairedTransform":
+        """根据配置构建增强流水线。
+
+        Args:
+            config: 全局配置字典，读取 ``augmentation`` 一节。
+            train:  是否为训练阶段。
+
+        Returns:
+            PairedTransform: 可调用对象，接受 (image, target) 并返回增强结果。
+        """
+        if not train:
+            # 验证/测试阶段一律使用确定性变换，保证指标可复现。
+            return cls(train=False)
+
+        aug_cfg = config.get("augmentation", {}) or {}
+        return cls(
+            train=True,
+            hflip_prob=float(aug_cfg.get("hflip_prob", 0.5)),
+            vflip_prob=float(aug_cfg.get("vflip_prob", 0.5)),
+            rotate90=bool(aug_cfg.get("rotate90", True)),
+            brightness=float(aug_cfg.get("brightness", 0.1)),
+            contrast=float(aug_cfg.get("contrast", 0.1)),
+            noise_std=float(aug_cfg.get("noise_std", 0.01)),
+        )
+
+    def _apply_geometric(
+        self, image: np.ndarray, target: Optional[np.ndarray]
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """同步执行翻转与 90 度倍数旋转。
+
+        Args:
+            image:  输入 DAPI 图像，HWC 布局。
+            target: 配对真值图像，无真值时为 ``None``。
+
+        Returns:
+            Tuple[np.ndarray, Optional[np.ndarray]]: 变换后的 (输入, 真值)。
+        """
+        if random.random() < self.hflip_prob:
+            image = np.ascontiguousarray(image[:, ::-1])
+            if target is not None:
+                target = np.ascontiguousarray(target[:, ::-1])
+
+        if random.random() < self.vflip_prob:
+            image = np.ascontiguousarray(image[::-1, :])
+            if target is not None:
+                target = np.ascontiguousarray(target[::-1, :])
+
+        if self.rotate90:
+            k = random.randint(0, 3)  # 0/90/180/270 度
+            if k > 0:
+                image = np.ascontiguousarray(np.rot90(image, k))
+                if target is not None:
+                    target = np.ascontiguousarray(np.rot90(target, k))
+        return image, target
+
+    def _apply_photometric(self, image: np.ndarray) -> np.ndarray:
+        """对输入图像施加亮度、对比度与高斯噪声扰动。
+
+        Args:
+            image: 输入 DAPI 图像，取值 ``[0, 1]``。
+
+        Returns:
+            np.ndarray: 扰动后的图像，仍裁剪在 ``[0, 1]`` 内。
+        """
+        if self.brightness > 0:
+            image = image + random.uniform(-self.brightness, self.brightness)
+
+        if self.contrast > 0:
+            factor = 1.0 + random.uniform(-self.contrast, self.contrast)
+            mean = float(image.mean())
+            image = (image - mean) * factor + mean
+
+        if self.noise_std > 0:
+            noise = np.random.normal(0.0, self.noise_std, image.shape)
+            image = image + noise.astype(np.float32)
+
+        return np.clip(image, 0.0, 1.0).astype(np.float32)
+
+    def __call__(
+        self, image: np.ndarray, target: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """执行增强流水线。
+
+        Args:
+            image:  输入图像，HWC float32，取值 ``[0, 1]``。
+            target: 配对真值，可为 ``None``。
+
+        Returns:
+            Tuple[np.ndarray, Optional[np.ndarray]]: (增强后输入, 增强后真值)。
+        """
+        if self.train:
+            image, target = self._apply_geometric(image, target)
+            image = self._apply_photometric(image)
+        return image, target
+
+
+# ------------------------------------------------------------------ #
+# 数据集
+# ------------------------------------------------------------------ #
+class VirtualStainingDataset(Dataset):
+    """单标记配对数据集：DAPI -> 指定 IHC 标记。
+
+    每个样本返回::
+
+        {
+            "input":  (C_in, H, W)  张量,   # DAPI
+            "target": (C_out, H, W) 张量,   # 目标标记（测试模式无此键）
+            "name":   文件名（不含后缀）,   # 用于结果命名对应
+        }
+    """
+
+    def __init__(
+        self,
+        root: str,
+        marker: str,
+        split: str = "train",
+        transform: Optional[Callable] = None,
+        file_list: Optional[List[str]] = None,
+        cache: bool = False,
+    ) -> None:
+        """收集 DAPI 与目标标记的同名配对样本。
+
+        Args:
+            root:       数据根目录（支持多器官/单器官两种组织方式）。
+            marker:     目标标记名，必须是 ``MARKERS`` 之一。
+            split:      ``"train"`` 或 ``"test"``。
+            transform:  增强流水线，签名为 ``(image, target) -> (image, target)``。
+            file_list:  可选的文件名白名单（来自 ROI 划分文件）。
+            cache:      是否在内存中缓存全部解码图像（大内存机器建议开启）。
+
+        Raises:
+            ValueError: 标记名非法或未找到任何配对样本时抛出。
+        """
+        super().__init__()
+        if marker not in MARKERS:
+            raise ValueError(f"未知标记 '{marker}'，可选: {MARKERS}")
+
+        self.marker = marker
+        self.transform = transform
+        # (源图路径, 真值路径或 None[测试模式])，跨器官聚合配对样本。
+        self.samples: List[Tuple[Path, Optional[Path]]] = []
+
+        for _split_dir, marker_dirs in DatasetSource.discover_marker_dirs(root, split):
+            # 测试集无真值目录，此时真值置 None 仅保留输入。
+            target_dir = marker_dirs.get(marker) if split == "train" else None
+            for source_path in DatasetSource.list_images(marker_dirs[SOURCE_MARKER]):
+                if file_list is not None and source_path.stem not in file_list:
+                    continue
+
+                target_path: Optional[Path] = None
+                if target_dir is not None:
+                    candidate = target_dir / source_path.name
+                    if not candidate.is_file():
+                        continue  # 缺失配对真值的样本直接跳过
+                    target_path = candidate
+                self.samples.append((source_path, target_path))
+
+        if not self.samples:
+            raise ValueError(
+                f"未找到配对样本: root={root}, marker={marker}, split={split}"
+            )
+
+        # 可选的内存缓存：一次性解码全部图像为 uint8，取用时再归一化，
+        # 避免每个 epoch 重复 JPG 解码的开销。
+        self._cache: Optional[Dict[Path, np.ndarray]] = None
+        if cache:
+            self._cache = {}
+            for source_path, target_path in self.samples:
+                self._cache[source_path] = DatasetSource.read_uint8(source_path)
+                if target_path is not None:
+                    self._cache[target_path] = DatasetSource.read_uint8(
+                        target_path, grayscale=True
+                    )
+
+    def __len__(self) -> int:
+        """返回配对样本总数。"""
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        """读取并增强一个样本。
+
+        Args:
+            index: 样本下标。
+
+        Returns:
+            Dict[str, Any]: 包含 ``input``/``name``，训练模式另含 ``target``。
+        """
+        source_path, target_path = self.samples[index]
+
+        if self._cache is not None:
+            # 命中缓存时直接复用 uint8 数据，避免重复 JPG 解码。
+            image = DatasetSource.uint8_to_float(self._cache[source_path])
+            target = (
+                DatasetSource.uint8_to_float(self._cache[target_path])
+                if target_path is not None
+                else None
+            )
+        else:
+            image = DatasetSource.read_float(source_path)
+            target = (
+                DatasetSource.read_float(target_path, grayscale=True)
+                if target_path is not None
+                else None
+            )
+
+        if self.transform is not None:
+            image, target = self.transform(image, target)
+
+        sample: Dict[str, Any] = {
+            "input": self._to_tensor(image),
+            "name": source_path.stem,
+        }
+        if target is not None:
+            sample["target"] = self._to_tensor(target)
+        return sample
+
+    @staticmethod
+    def _to_tensor(image: np.ndarray) -> torch.Tensor:
+        """将 HWC float 数组转换为 CHW 的 torch 张量。
+
+        Args:
+            image: HWC 布局的 float 数组。
+
+        Returns:
+            torch.Tensor: CHW 张量。
+        """
+        return torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+
+
+class MultiMarkerDataset(Dataset):
+    """多标记条件数据集：一个 DAPI 样本随机配对一种目标标记。
+
+    用于一对多联合建模的训练策略：每次取样本时随机采样一个目标标记
+    并返回其编号，供模型的 marker token 使用。
+
+    每个样本返回::
+
+        {
+            "input":       (C, H, W) 张量,
+            "target":      (C, H, W) 张量,
+            "marker_idx":  目标标记编号（对应 src.data.constants.MARKERS 顺序）,
+            "name":        文件名,
+        }
+    """
+
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        markers: Optional[List[str]] = None,
+        transform: Optional[Callable] = None,
+        file_list: Optional[List[str]] = None,
+        cache: bool = False,
+        random_marker: bool = True,
+    ) -> None:
+        """收集同时存在全部目标标记真值的样本。
+
+        只有四类标记真值齐全的 patch 才纳入，保证任意随机采样
+        标记时都有监督信号。
+
+        Args:
+            root:      数据根目录。
+            split:     划分名称（该数据集仅用于训练/验证）。
+            markers:   参与联合建模的标记列表，默认全部四类。
+            transform: 增强流水线。
+            file_list: ROI 划分文件名白名单。
+            cache:     是否在内存中缓存全部解码图像（大内存机器建议开启）。
+            random_marker: 是否随机采样目标标记；训练置 ``True``，
+                验证置 ``False`` 以按样本下标确定性轮转标记，稳定指标。
+
+        Raises:
+            ValueError: 未找到任何全配对样本时抛出。
+        """
+        super().__init__()
+        self.markers = markers or list(MARKERS)
+        self.transform = transform
+        self.random_marker = random_marker
+        # 文件名 -> (DAPI路径, {标记: 路径})
+        self.index: Dict[str, Tuple[Path, Dict[str, Path]]] = {}
+
+        for _split_dir, marker_dirs in DatasetSource.discover_marker_dirs(root, split):
+            if SOURCE_MARKER not in marker_dirs:
+                continue
+            if not all(marker in marker_dirs for marker in self.markers):
+                continue  # 该组标记不全，无法用于联合建模
+
+            for source_path in DatasetSource.list_images(marker_dirs[SOURCE_MARKER]):
+                if file_list is not None and source_path.stem not in file_list:
+                    continue
+
+                target_map: Dict[str, Path] = {}
+                for marker in self.markers:
+                    candidate = marker_dirs[marker] / source_path.name
+                    if not candidate.is_file():
+                        break
+                    target_map[marker] = candidate
+                else:
+                    self.index[source_path.stem] = (source_path, target_map)
+
+        if not self.index:
+            raise ValueError(f"未找到全标记配对样本: root={root}, split={split}")
+        self.names = sorted(self.index.keys())
+
+        # 可选的内存缓存：一次性解码全部源图与各标记真值，取用时再归一化。
+        self._cache: Optional[Dict[str, Tuple[np.ndarray, Dict[str, np.ndarray]]]] = None
+        if cache:
+            self._cache = {
+                name: (
+                    DatasetSource.read_uint8(source_path),
+                    {
+                        marker: DatasetSource.read_uint8(path, grayscale=True)
+                        for marker, path in target_map.items()
+                    },
+                )
+                for name, (source_path, target_map) in self.index.items()
+            }
+
+    def __len__(self) -> int:
+        """返回样本总数（每样本每 epoch 随机配对一种标记）。"""
+        return len(self.names)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        """读取样本并随机采样一个目标标记。
+
+        Args:
+            index: 样本下标。
+
+        Returns:
+            Dict[str, Any]: 含 ``input``/``target``/``marker_idx``/``name``。
+        """
+        name = self.names[index]
+        source_path, target_map = self.index[name]
+
+        # 训练阶段随机采样目标标记实现一对多监督；验证阶段按样本下标
+        # 确定性轮转标记，避免每轮验证的 marker 随机导致指标抖动、
+        # 早停选点不稳定。
+        if self.random_marker:
+            marker_idx = int(np.random.randint(0, len(self.markers)))
+        else:
+            marker_idx = index % len(self.markers)
+        marker = self.markers[marker_idx]
+
+        if self._cache is not None:
+            source_uint8, cached_targets = self._cache[name]
+            image = DatasetSource.uint8_to_float(source_uint8)
+            target = DatasetSource.uint8_to_float(cached_targets[marker])
+        else:
+            image = DatasetSource.read_float(source_path)
+            target = DatasetSource.read_float(target_map[marker], grayscale=True)
+
+        if self.transform is not None:
+            image, target = self.transform(image, target)
+
+        return {
+            "input": VirtualStainingDataset._to_tensor(image),
+            "target": VirtualStainingDataset._to_tensor(target),
+            "marker_idx": marker_idx,
+            "name": name,
+        }
+
+
+# ------------------------------------------------------------------ #
+# DataLoader
+# ------------------------------------------------------------------ #
+class DataLoaders:
+    """训练/验证/测试 DataLoader 的构建与并行调优。
+
+    关键参数：自动探测 ``num_workers``、增大 ``prefetch_factor``、
+    常开 ``persistent_workers``，并让每个 worker 拥有独立随机种子。
+    """
+
+    @staticmethod
+    def optimal_workers(data_cfg: Dict[str, Any]) -> int:
+        """计算最优 num_workers：物理核心数 - 2，留余量给主进程。
+
+        Args:
+            data_cfg: 配置中的 ``data`` 一节。
+
+        Returns:
+            int: worker 进程数，取值 ``[1, 16]``。
+        """
+        configured = data_cfg.get("num_workers")
+        if configured is not None and int(configured) > 0:
+            return int(configured)
+        # 留 2 个核心给主进程和其他任务，避免数据预处理与训练争抢 CPU。
+        return max(1, min((os.cpu_count() or 4) - 2, 16))
+
+    @staticmethod
+    def _worker_init(worker_id: int) -> None:
+        """多进程随机种子独立，避免增强同质化。
+
+        Args:
+            worker_id: DataLoader 分配的 worker 序号。
+
+        Returns:
+            None
+        """
+        seed = torch.initial_seed() % (2**32)
+        np.random.seed(seed + worker_id)
+
+    @classmethod
+    def _datasets(
+        cls, config: Dict[str, Any]
+    ) -> Tuple[Dataset, Dataset]:
+        """构建训练/验证数据集（条件模型用一对多数据集）。
+
+        Args:
+            config: 全局配置字典。
+
+        Returns:
+            Tuple[Dataset, Dataset]: (训练集, 验证集)。
+        """
+        data_cfg = config.get("data", {})
+        root = data_cfg.get("root", "data")
+        split_dir = data_cfg.get("split_dir", "data/splits")
+        cache = bool(data_cfg.get("cache", False))
+
+        # ROI 划分文件必须存在：否则训练集与验证集会退化为同一份数据，
+        # 造成严重的信息泄漏（验证指标虚高）。此处快速失败并提示修复方式。
+        split_file = Path(split_dir) / "split.json"
+        if not split_file.is_file():
+            raise FileNotFoundError(
+                f"未找到 ROI 划分文件: {split_file}，请先执行 "
+                "`uv run main.py split --root <数据根目录>`（按 ROI 划分以避免数据泄漏）"
+            )
+        train_list, val_list = DatasetSplitter.load(split_dir)
+
+        if ModelRegistry.is_conditional(config):
+            return (
+                MultiMarkerDataset(
+                    root=root,
+                    transform=PairedTransform.from_config(config, train=True),
+                    file_list=train_list,
+                    cache=cache,
+                ),
+                MultiMarkerDataset(
+                    root=root,
+                    transform=PairedTransform.from_config(config, train=False),
+                    file_list=val_list,
+                    cache=cache,
+                    random_marker=False,
+                ),
+            )
+
+        marker = data_cfg.get("marker", "CD68")
+        return (
+            VirtualStainingDataset(
+                root=root,
+                marker=marker,
+                transform=PairedTransform.from_config(config, train=True),
+                file_list=train_list,
+                cache=cache,
+            ),
+            VirtualStainingDataset(
+                root=root,
+                marker=marker,
+                transform=PairedTransform.from_config(config, train=False),
+                file_list=val_list,
+                cache=cache,
+            ),
+        )
+
+    @classmethod
+    def build(cls, config: Dict[str, Any]) -> Dict[str, DataLoader]:
+        """构建训练与验证 DataLoader。
+
+        Args:
+            config: 全局配置字典。
+
+        Returns:
+            Dict[str, DataLoader]: 键为 ``"train"`` / ``"val"``。
+        """
+        data_cfg = config.get("data", {})
+        train_dataset, val_dataset = cls._datasets(config)
+
+        common_kwargs: Dict[str, Any] = {
+            "num_workers": cls.optimal_workers(data_cfg),
+            "pin_memory": True,
+            "persistent_workers": True,
+            # prefetch_factor: 每个 worker 预取 batch 数，GPU 越快该值应越大。
+            "prefetch_factor": max(2, int(data_cfg.get("prefetch_factor", 4))),
+            "worker_init_fn": cls._worker_init,
+        }
+        batch_size = int(config.get("training", {}).get("batch_size", 16))
+        return {
+            "train": DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=True,
+                **common_kwargs,
+            ),
+            "val": DataLoader(
+                val_dataset, batch_size=batch_size, shuffle=False, **common_kwargs
+            ),
+        }
+
+    @classmethod
+    def for_test(cls, config: Dict[str, Any]) -> DataLoader:
+        """构建测试集 DataLoader（仅有 DAPI 输入，无真值）。
+
+        Args:
+            config: 全局配置字典。
+
+        Returns:
+            DataLoader: 保持文件名顺序的测试集加载器。
+        """
+        data_cfg = config.get("data", {})
+        dataset = VirtualStainingDataset(
+            root=data_cfg.get("root", "data"),
+            marker=data_cfg.get("marker", "CD68"),
+            split="test",
+            transform=PairedTransform.from_config(config, train=False),
+        )
+        return DataLoader(
+            dataset,
+            batch_size=int(config.get("training", {}).get("batch_size", 16)),
+            shuffle=False,
+            num_workers=cls.optimal_workers(data_cfg),
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
+        )
