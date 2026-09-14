@@ -770,6 +770,10 @@ class Predictor:
     def run_multi_marker(self, checkpoint_path: str) -> None:
         """用多标记条件模型一次性生成全部四种标记的结果。
 
+        推理前向统一走 ``tta_forward``：与单标记推理、逐标记评估及集成保持
+        同一口径，TTA 开启时对 8 种几何等价视图取平均，避免条件模型静默
+        退化为单次前向。
+
         Args:
             checkpoint_path: 条件模型 checkpoint。
 
@@ -783,7 +787,10 @@ class Predictor:
                 idx_tensor = torch.full(
                     (inputs.shape[0],), marker_idx, dtype=torch.long, device=self.device
                 )
-                predictions = self.unpack(self.model(inputs, idx_tensor))
+                # 条件模型按标记编号传入 marker_idx；TTA 开关由配置决定。
+                predictions = self.tta_forward(
+                    self.model, inputs, idx_tensor, enabled=self.tta
+                )
                 self.save_batch(
                     predictions, batch["name"], marker, self.output_root, self.suffix
                 )
