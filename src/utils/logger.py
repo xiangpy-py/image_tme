@@ -64,12 +64,14 @@ class ExperimentLogger:
         recorder.finish()
     """
 
-    def __init__(self, log_dir: str, fieldnames: List[str]) -> None:
+    def __init__(self, log_dir: str, fieldnames: List[str], append: bool = False) -> None:
         """初始化记录器并创建 CSV 表头。
 
         Args:
             log_dir:    本次实验的日志目录。
             fieldnames: CSV 列名，例如 ``["epoch", "train_loss", "val_ssim"]``。
+            append:     续训场景传 ``True``：沿用已有 ``history.csv`` 并追加记录，
+                避免覆盖此前 epoch 的历史。
         """
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -78,6 +80,15 @@ class ExperimentLogger:
         self.json_path = self.log_dir / "history.json"
         self._fieldnames = fieldnames
         self._records: List[Dict[str, Any]] = []
+
+        # 续训时读回历史记录，仅在整体完成时随 JSON 一起重写；否则新建表头。
+        if append and self.csv_path.is_file():
+            with open(self.csv_path, "r", newline="", encoding="utf-8") as file:
+                self._records = [
+                    {key: row.get(key, "") for key in fieldnames}
+                    for row in csv.DictReader(file)
+                ]
+            return
 
         with open(self.csv_path, "w", newline="", encoding="utf-8") as file:
             csv.DictWriter(file, fieldnames=fieldnames).writeheader()

@@ -10,10 +10,13 @@ dependencies = [
     "pillow>=12.3.0",
     "pyyaml>=6.0.3",
     "scikit-image>=0.26.0",
-    "torch>=2.13.0",
-    "torchvision>=0.28.0",
     "tqdm>=4.70.0",
 ]
+
+# torch/torchvision 与显卡驱动强绑定（不同服务器驱动支持的 CUDA 版本不同），
+# 若写进锁文件就会把某一台机器的构建固化下来，故不在此声明：
+# 交由 sync.sh 调用 `uv pip install --torch-backend=auto` 按本机驱动自动选择构建。
+# 注意：因此裸 `uv sync` 不含 torch，初始化/更新环境请统一使用 `bash sync.sh`。
 
 # 本项目是「应用」而非「可安装库」：不构建/安装自身，依赖统一交给 uv 管理。
 [tool.uv]

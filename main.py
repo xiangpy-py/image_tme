@@ -82,12 +82,14 @@ def cmd_experiments(args: argparse.Namespace) -> None:
     """实验矩阵：赛马制「短实验筛选 -> 排行榜 -> Top-K 长训练」。
 
     Args:
-        args: 含 ``matrix`` / ``stage`` / ``device``。
+        args: 含 ``matrix`` / ``stage`` / ``device`` / ``resume``。
 
     Returns:
         None
     """
-    Operator(args.device).run_experiments(ConfigManager.load(args.matrix), args.stage)
+    Operator(args.device).run_experiments(
+        ConfigManager.load(args.matrix), args.stage, resume=bool(args.resume)
+    )
 
 
 def cmd_infer(args: argparse.Namespace) -> None:
@@ -270,6 +272,12 @@ def parse_args() -> argparse.Namespace:
         metavar="DEV",
         help="覆盖 runtime.device，如 auto / cpu / cuda / cuda:0",
     )
+    train_parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=None,
+        help="从 checkpoints/<实验名>/last.pth 断点续训（不传则以配置为准）",
+    )
     train_parser.set_defaults(func=cmd_train)
 
     # ---- experiments ----
@@ -313,6 +321,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="DEV",
         help="覆盖运行设备（默认: 自动探测）",
+    )
+    exp_parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="断点续训：各作业从各自 last.pth 恢复进度，已完成实验不重跑",
     )
     exp_parser.set_defaults(func=cmd_experiments)
 

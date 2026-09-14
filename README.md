@@ -103,7 +103,7 @@ data / utils  <-  train  <-  layout  <-  allocate  <-  operate  ->  feedback
 | | `Trainer` / `Predictor` | 训练全流程（AMP/EMA/compile）/ 推理与提交结果生成 |
 | 编排 | `Layout` | 超参数 → 训练作业列表（单实验、实验矩阵两阶段） |
 | | `Allocator` | 按本机 GPU 数量把作业切分为并行波次，支持再分配优先级 |
-| | `Operator` | 执行波次、产出作业结果，并提供训练/矩阵等上层用例 |
+| | `Operator` | 执行波次、产出作业结果；每波次完成即写排行榜，并提供训练/矩阵等上层用例 |
 | | `Feedback` | 排行榜写入与聚合、后缀还原、Top-K 筛选、再分配提示 |
 | | `Ensembler` | 多实验预测结果逐像素平均 |
 
@@ -157,16 +157,17 @@ uv run main.py train --config <FILE>
 | `--marker` | 配置中的 `data.marker` | `CD68`/`CD45RO`/`HLA-DR`/`Vimentin`，或 `all` 训练全部四类；条件模型可省略 |
 | `--epochs` / `--batch-size` / `--lr` | `None` | 覆盖配置中的对应超参（不传则以配置为准） |
 | `--device` | `None` | 覆盖 `runtime.device`：`auto`/`cpu`/`cuda`/`cuda:0` |
+| `--resume` | 配置 `training.resume` | 从 `checkpoints/<实验名>/last.pth` 断点续训；恢复模型/优化器/调度器与训练进度，逐 epoch 曲线自动续接 |
 
 单标记模型按标记展开为多个作业，实验名自动追加 `_<标记小写>` 后缀
 （如 `exp001_unet_baseline_cd68`，`HLA-DR` → `_hladr`）；条件模型只产生一个作业。
 
 **产物**
 
-- `checkpoints/<实验名>/best.pth`：按验证集综合得分保存的最优权重（EMA 更优时保存 EMA 权重）
-- `checkpoints/<实验名>/last.pth`：最新权重
-- `logs/<实验名>/`：`history.csv`/`history.json`、实际生效配置 `config.yaml`、训练日志
-- `logs/leaderboard.csv`：全部作业的排行榜
+- `checkpoints/<实验名>/best.pth`：验证集综合得分最优的**推理权重**（EMA 更优时保存 EMA 权重）。仅含权重不含优化器状态，体积约为完整状态的 1/3
+- `checkpoints/<实验名>/last.pth`：最新一轮的**完整训练状态**（权重 + 优化器 + 调度器），供 `--resume` 断点续训
+- `logs/<实验名>/`：`history.csv`/`history.json`、实际生效配置 `config.yaml`、训练日志 `train.log`（每个实验独立文件）
+- `logs/leaderboard.csv`：全部作业的排行榜，**每个波次完成即增量落盘**，阶段中途崩溃也不会丢失已完成作业的成绩
 
 ### 3.4 experiments（实验矩阵）
 
@@ -179,10 +180,12 @@ uv run main.py experiments --matrix <FILE> --stage screening|full|report|all [--
 | `--matrix` | 实验矩阵 YAML（含 `screening` / `full` / `experiments` 三节） |
 | `--stage` | `screening`=短实验筛选；`full`=Top-K 长训练；`report`=仅打印排行榜；`all`=两阶段连跑 |
 | `--device` | 覆盖运行设备 |
+| `--resume` | 断点续训：各作业从各自 `last.pth` 恢复进度，已完成的实验秒退不重跑，脚本可反复执行 |
 
 流程：布局器把矩阵展开为作业 → 分配器按 GPU 数量切分并行波次 → 操作器执行 →
 反馈器写入排行榜并选出 Top-K → Top-K 以再分配提示的形式被优先调度进入长训练。
 筛选阶段的实验目录带 `_screen` 后缀，避免覆盖长训练的产物。
+配合 `--resume` 时，筛选/长训练两阶段都可安全中断续跑。
 
 ### 3.5 infer
 
@@ -288,6 +291,18 @@ data/
 （`data/train/<MARKER>`）两种结构；目标标记统一按单通道灰度读取，
 与模型 `out_channels: 1` 对应。
 
+**train 与 test 的职责区分（务必分清）**
+
+| 目录 | 内容 | 用途 |
+| --- | --- | --- |
+| `data/train/` | DAPI + 四类标记真值（同名配对） | 训练数据；由 `split` 命令**按 ROI 再划分**为本地训练集/验证集 |
+| `data/test/DAPI/` | 仅 DAPI 输入，**无标签** | 赛方测试集输入；仅用于 `infer` 生成提交结果 |
+
+- 赛题官方只发布「训练数据 + 测试集输入」，测试集标签不公开，且要求参赛者**自行划分本地训练集与验证集**。
+- 因此本项目的比例划分产物是**本地验证集（val）**，用于模型选择与早停判断；它**不是**官方测试集。
+- 划分以 ROI 前缀（`ROIxxx`）为最小单位，保证同一 ROI 的相邻 patch 只出现在同一侧，避免信息泄漏。
+- `data/test/` 不参与任何训练或调参，只做推理，结果输出到 `results/test/<MARKER>/<原名>_fake.jpg`，打包上传即可。
+
 ---
 
 ## 6. 模型与训练要点
@@ -306,6 +321,8 @@ data/
 - **同步增强**：几何变换对 DAPI 与真值同步；亮度/对比度/噪声只作用于输入。
 - **可复现**：固定全部随机源；每次运行把实际生效配置落盘到 `logs/<实验名>/config.yaml`。
 - **数值稳定**：损失在 autocast 之外以 fp32 计算，避免 fp16 下 SSIM 灾难性抵消。
+- **checkpoint 瘦身**：`best.pth` 只存推理权重，`last.pth` 才存完整训练状态（权重 + 优化器 + 调度器）。
+- **断点续训**：`--resume`（或 `training.resume: true`）从 `last.pth` 恢复进度继续训练，已完成的 epoch 不会重跑。
 - **并行**：多 GPU 时每个作业绑定一张卡、以 `spawn` 子进程并行；纯 CPU 环境自动串行。
 
 ---
@@ -315,7 +332,13 @@ data/
 - 仅使用赛事官方数据；不使用任何闭源在线 API 完成图像生成。
 - 推理全自动，无人工逐张处理或测试集后处理。
 - 随机种子、数据划分文件、生效配置与逐 epoch 指标均已持久化，便于复现。
+- 排行榜逐波次增量落盘，训练中断也不会丢失已完成作业的成绩。
 - `runtime.deterministic: false` 时启用 cuDNN 自动调优以获得更快训练速度。
+
+> **评测口径说明**：赛题仅给出 `Score = 70% × SSIM + 30% × Normalize(PSNR)`，
+> 未定义 `Normalize(PSNR)`。本项目取最常见做法：将 PSNR 裁剪到 `[0, 40] dB`
+> 后除以 40 归一化（见 [src/train/metrics.py](src/train/metrics.py)），
+> 若官方口径不同需据此调整。
 
 > 依赖清单见 `pyproject.toml`；本项目为应用型工程（`[tool.uv] package = false`），
 > 统一通过 `uv run main.py ...` 调用。

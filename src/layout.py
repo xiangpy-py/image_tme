@@ -123,7 +123,7 @@ class Layout:
     # ------------------------------------------------------------------ #
     @staticmethod
     def job_config(
-        matrix: Dict[str, Any], experiment: Dict[str, Any], stage: str
+        matrix: Dict[str, Any], experiment: Dict[str, Any], stage: str, resume: bool = False
     ) -> Dict[str, Any]:
         """由矩阵条目合成一份完整训练配置。
 
@@ -131,6 +131,7 @@ class Layout:
             matrix:     实验矩阵（含 screening / full 两阶段参数）。
             experiment: 矩阵中的单个实验条目（name / base / overrides）。
             stage:      ``"screening"`` 或 ``"full"``。
+            resume:     是否开启断点续训（注入 ``training.resume``）。
 
         Returns:
             Dict[str, Any]: 可直接交给 ``Trainer`` 的配置。
@@ -143,6 +144,10 @@ class Layout:
         config.setdefault("training", {})["epochs"] = int(
             stage_cfg.get("epochs", 15 if stage == "screening" else 100)
         )
+
+        # 续训开关：矩阵级统一注入，作业内 Trainer 据此从 last.pth 恢复进度。
+        if resume:
+            config.setdefault("training", {})["resume"] = True
 
         # 筛选阶段实验名加后缀，避免覆盖长训练的 checkpoint 与日志。
         name = experiment["name"]
@@ -158,7 +163,9 @@ class Layout:
         return config
 
     @classmethod
-    def stage_jobs(cls, matrix: Dict[str, Any], stage: str) -> List[JobSpec]:
+    def stage_jobs(
+        cls, matrix: Dict[str, Any], stage: str, resume: bool = False
+    ) -> List[JobSpec]:
         """把实验矩阵的某一阶段展开为作业列表。
 
         条件模型一次训练覆盖全部标记（1 个作业）；单标记模型在筛选阶段
@@ -167,13 +174,14 @@ class Layout:
         Args:
             matrix: 实验矩阵。
             stage:  ``"screening"`` 或 ``"full"``。
+            resume: 是否开启断点续训。
 
         Returns:
             List[JobSpec]: 该阶段全部待调度作业。
         """
         jobs: List[JobSpec] = []
         for experiment in matrix.get("experiments", []):
-            config = cls.job_config(matrix, experiment, stage)
+            config = cls.job_config(matrix, experiment, stage, resume=resume)
 
             if ModelRegistry.is_conditional(config):
                 jobs.append(

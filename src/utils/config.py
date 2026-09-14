@@ -76,6 +76,7 @@ class ConfigManager:
             "batch_size": ("training", "batch_size"),
             "lr": ("training", "lr"),
             "device": ("runtime", "device"),
+            "resume": ("training", "resume"),
         }
         for arg_name, (section, key) in override_map.items():
             value = getattr(args, arg_name, None)

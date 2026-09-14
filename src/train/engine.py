@@ -70,7 +70,11 @@ class Trainer:
         self.experiment_name = config.get("experiment", {}).get("name", "exp")
         self.log_dir = Path("logs") / self.experiment_name
         self.checkpoint_dir = Path("checkpoints") / self.experiment_name
-        self.logger = LoggerFactory.create("trainer", str(self.log_dir / "train.log"))
+        # logger 名称带上实验名：同一进程顺序训练多个作业时，避免复用首个
+        # logger 的文件 handler，导致后续实验日志写入前一个实验的 train.log。
+        self.logger = LoggerFactory.create(
+            f"trainer.{self.experiment_name}", str(self.log_dir / "train.log")
+        )
 
         self.epochs = int(train_cfg.get("epochs", 100))
         self.conditional = ModelRegistry.is_conditional(config)
@@ -129,6 +133,14 @@ class Trainer:
                 eta_min=float(train_cfg.get("min_lr", 1e-6)),
             )
 
+        # ---- 训练状态与断点续训 ----
+        self.best_score = 0.0
+        self.start_epoch = 0
+        self.resume = bool(train_cfg.get("resume", False))
+        if self.resume:
+            # 必须早于 EMA 初始化：让 EMA 阴影以续训后的权重为起点。
+            self._resume_from_last()
+
         # ---- EMA ----
         self.use_ema = bool(train_cfg.get("ema", False))
         self.ema = (
@@ -139,8 +151,7 @@ class Trainer:
         # EMA 每隔 N 个 epoch 才额外评估一次，验证集较大时可显著降低开销。
         self.ema_eval_every = max(1, int(train_cfg.get("ema_eval_every", 1)))
 
-        # ---- 训练状态 ----
-        self.best_score = 0.0
+        # ---- 逐 epoch 记录器 ----
         self.recorder = ExperimentLogger(
             str(self.log_dir),
             fieldnames=[
@@ -152,6 +163,7 @@ class Trainer:
                 "val_score",
                 "lr",
             ],
+            append=self.resume,
         )
 
         self.logger.info(
@@ -161,6 +173,42 @@ class Trainer:
             + (" | AMP: 开" if self.use_amp else "")
             + (" | EMA: 开" if self.use_ema else "")
             + (f" | Compile: {self.compile_mode}" if self.compile_mode else "")
+            + (f" | 续训自 epoch {self.start_epoch}" if self.start_epoch else "")
+        )
+
+    # ------------------------------------------------------------------ #
+    # 断点续训
+    # ------------------------------------------------------------------ #
+    def _resume_from_last(self) -> None:
+        """从 ``last.pth`` 恢复模型 / 优化器 / 调度器状态与训练进度。
+
+        找不到 ``last.pth`` 时仅告警并从头训练，不中断流程。
+
+        Returns:
+            None
+        """
+        last_path = self.checkpoint_dir / "last.pth"
+        if not last_path.is_file():
+            self.logger.warning(f"续训已开启但未找到 {last_path}，将从头开始训练")
+            return
+
+        # 权重与优化器状态同设备加载，避免 CPU -> GPU 的额外拷贝。
+        info = CheckpointManager.load(
+            str(last_path),
+            self.base_model,
+            self.optimizer,
+            map_location=str(self.device),
+            scheduler=self.scheduler,
+        )
+        if not info["has_optimizer"]:
+            # last.pth 被瘦身保存时无法精确恢复优化器动量，仍可续训但需知晓。
+            self.logger.warning("last.pth 不含优化器状态，优化器动量将从零重新累计")
+
+        self.start_epoch = int(info["epoch"])
+        self.best_score = float(info["best_score"])
+        self.logger.info(
+            f"续训：已恢复 {self.start_epoch} 个 epoch，"
+            f"历史最优 Score={self.best_score:.4f}"
         )
 
     # ------------------------------------------------------------------ #
@@ -292,10 +340,16 @@ class Trainer:
         Returns:
             float: 训练过程中的最优验证综合得分。
         """
-        self.logger.info(f"开始训练，共 {self.epochs} 个 epoch")
+        if self.start_epoch > 0:
+            self.logger.info(
+                f"续训开始：从第 {self.start_epoch + 1} 个 epoch 继续，"
+                f"共 {self.epochs} 个 epoch"
+            )
+        else:
+            self.logger.info(f"开始训练，共 {self.epochs} 个 epoch")
         start_time = time.time()
 
-        for epoch in range(self.epochs):
+        for epoch in range(self.start_epoch, self.epochs):
             train_loss = self.train_one_epoch(epoch)
 
             # 每个 epoch 验证原始权重；EMA 按 ema_eval_every 间隔评估。
@@ -331,7 +385,13 @@ class Trainer:
                 f"Score={val_metrics['score']:.4f} | 权重来源={weight_source}"
             )
 
-            # 保存 checkpoint：始终基于 base_model，避免 _orig_mod 前缀。
+            if val_metrics["score"] > self.best_score:
+                self.best_score = val_metrics["score"]
+                self._save_best(epoch, weight_source)
+
+            # last.pth 保存完整训练状态（含优化器/调度器），供断点续训。
+            # 必须在 best_score 更新之后保存，续训时才能读到最新的历史最优分，
+            # 否则续训会把此前更优的 best.pth 覆盖成较差的权重。
             CheckpointManager.save(
                 self.base_model,
                 self.optimizer,
@@ -339,10 +399,8 @@ class Trainer:
                 self.best_score,
                 self.config,
                 str(self.checkpoint_dir / "last.pth"),
+                scheduler=self.scheduler,
             )
-            if val_metrics["score"] > self.best_score:
-                self.best_score = val_metrics["score"]
-                self._save_best(epoch, weight_source)
 
         self.recorder.finish()
         self.logger.info(
@@ -368,11 +426,13 @@ class Trainer:
 
         CheckpointManager.save(
             self.base_model,
-            self.optimizer,
+            None,
             epoch + 1,
             self.best_score,
             self.config,
             str(self.checkpoint_dir / "best.pth"),
+            # 推理只需权重，瘦身保存（不含优化器状态），体积约为 1/3。
+            include_optimizer=False,
         )
 
         if restore_after:

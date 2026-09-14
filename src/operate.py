@@ -12,7 +12,7 @@ import copy
 import time
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .allocate import Allocator, Schedule, Wave
 from .feedback import Feedback, JobResult
@@ -95,11 +95,18 @@ class Operator:
             return [future.result() for future in futures]
 
     @staticmethod
-    def execute(schedule: Schedule) -> List[JobResult]:
+    def execute(
+        schedule: Schedule,
+        on_wave: Optional[Callable[[List[JobResult]], None]] = None,
+    ) -> List[JobResult]:
         """按调度计划依次执行各波次，汇总全部作业结果。
+
+        每完成一个波次即回调 ``on_wave``：排行榜等产物边跑边落盘，
+        即使后续波次崩溃（如磁盘写满）也不会丢失已完成作业的成绩。
 
         Args:
             schedule: 分配器产出的波次列表。
+            on_wave:  每完成一个波次后的回调（接收该波次结果）。
 
         Returns:
             List[JobResult]: 全部作业的运行结果（按执行顺序）。
@@ -110,7 +117,10 @@ class Operator:
                 f"[operate] 波次 {index}/{len(schedule)}："
                 + ", ".join(job.name for job, _device in wave)
             )
-            results.extend(Operator.run_wave(wave))
+            wave_results = Operator.run_wave(wave)
+            results.extend(wave_results)
+            if on_wave is not None and wave_results:
+                on_wave(wave_results)
         return results
 
     # ------------------------------------------------------------------ #
@@ -133,7 +143,8 @@ class Operator:
             f"作业数={len(jobs)} | {self.allocator.description} | "
             f"波次数={len(schedule)}"
         )
-        return self.execute(schedule)
+        # 排行榜随每个波次增量落盘，避免整阶段崩溃导致成绩全部丢失。
+        return self.execute(schedule, on_wave=self.feedback.record)
 
     def train_experiment(
         self, config: Dict[str, Any], marker: Optional[str] = None
@@ -147,15 +158,15 @@ class Operator:
         Returns:
             List[JobResult]: 各作业运行结果。
         """
-        results = self.run_schedule(Layout.train_jobs(config, marker))
-        self.feedback.record(results)
-        return results
+        # 排行榜已由 run_schedule 逐波次落盘，此处无需重复写入。
+        return self.run_schedule(Layout.train_jobs(config, marker))
 
     def run_stage(
         self,
         matrix: Dict[str, Any],
         stage: str,
         prioritize: Optional[Sequence[str]] = None,
+        resume: bool = False,
     ) -> List[JobResult]:
         """执行实验矩阵的某一阶段（screening / full）。
 
@@ -163,17 +174,22 @@ class Operator:
             matrix:     实验矩阵。
             stage:      阶段名。
             prioritize: 优先调度的实验名（来自反馈器的再分配提示）。
+            resume:     是否开启断点续训（作业从各自 ``last.pth`` 恢复）。
 
         Returns:
             List[JobResult]: 本阶段各作业运行结果。
         """
-        jobs = Layout.stage_jobs(matrix, stage)
-        self.logger.info(f"===== 阶段 [{stage}]：{len(jobs)} 个作业 =====")
+        jobs = Layout.stage_jobs(matrix, stage, resume=resume)
+        self.logger.info(
+            f"===== 阶段 [{stage}]：{len(jobs)} 个作业"
+            + ("（断点续训）=====" if resume else "=====")
+        )
         results = self.run_schedule(jobs, prioritize=prioritize)
-        self.feedback.record(results)
         return results
 
-    def run_full_stage(self, matrix: Dict[str, Any]) -> List[JobResult]:
+    def run_full_stage(
+        self, matrix: Dict[str, Any], resume: bool = False
+    ) -> List[JobResult]:
         """长训练阶段：按筛选排行榜取 Top-K 实验进行完整训练。
 
         这是「反馈器 -> 分配器」闭环的落地点：Top-K 由反馈器选出，
@@ -181,6 +197,7 @@ class Operator:
 
         Args:
             matrix: 实验矩阵（读取 ``full.top_k``）。
+            resume: 是否开启断点续训。
 
         Returns:
             List[JobResult]: 本阶段各作业运行结果。
@@ -199,14 +216,18 @@ class Operator:
             Layout.select_experiments(matrix, top_names),
             "full",
             prioritize=self.feedback.hints(top_names)["prioritize"],
+            resume=resume,
         )
 
-    def run_experiments(self, matrix: Dict[str, Any], stage: str) -> None:
+    def run_experiments(
+        self, matrix: Dict[str, Any], stage: str, resume: bool = False
+    ) -> None:
         """实验矩阵总入口：赛马制「短实验筛选 -> 排行榜 -> Top-K 长训练」。
 
         Args:
             matrix: 实验矩阵。
             stage:  ``"screening"`` / ``"full"`` / ``"report"`` / ``"all"``。
+            resume: 是否开启断点续训（沿用各作业已有的 ``last.pth``）。
 
         Returns:
             None
@@ -216,9 +237,9 @@ class Operator:
             return
 
         if stage in ("screening", "all"):
-            self.run_stage(matrix, "screening")
+            self.run_stage(matrix, "screening", resume=resume)
             self.feedback.print_leaderboard("screening")
 
         if stage in ("full", "all"):
-            self.run_full_stage(matrix)
+            self.run_full_stage(matrix, resume=resume)
             self.feedback.print_leaderboard("full")
