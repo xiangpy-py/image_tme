@@ -86,3 +86,8 @@ experiments:
     base: configs/conditional_v2.yaml
     overrides:
       augmentation: {brightness: 0.0, contrast: 0.0, noise_std: 0.0}
+
+  # ---- 架构对比：V3 主力（残差 + 深层 CBAM + FiLM，含冲榜损失权重）----
+  #     与上面 10 个 V2 超参候选同台筛选；--resume 下旧实验秒退，只新训本条。
+  - name: p11_resattn_v3
+    base: configs/conditional_v3.yaml

@@ -2,11 +2,12 @@
 
 自小到大组织：
 
-- 基础构件：``DoubleConv`` / ``ResidualBlock`` / ``Down`` / ``Up`` /
-  ``MarkerEmbedding``；
+- 基础构件：``DoubleConv`` / ``ResidualBlock`` / ``CBAM`` / ``Down`` / ``Up`` /
+  ``MarkerEmbedding`` / ``FiLM``；
 - 单标记模型：``UNet`` / ``ResNetUNet``；
 - 一对多条件模型：``ConditionalUNet`` / ``ConditionalUNetV2``（FiLM）/
-  ``AdapterUNet``（共享编解码器 + 标记适配器）；
+  ``AdapterUNet``（共享编解码器 + 标记适配器）/
+  ``ConditionalResAttentionUNet``（残差 + 深层 CBAM + 多尺度 FiLM）；
 - 统一入口：``ModelRegistry``（按配置实例化、判断是否条件模型）。
 
 所有模型输出均经 Sigmoid 约束到 ``[0, 1]`` 像素域。
@@ -99,11 +100,116 @@ class ResidualBlock(nn.Module):
         return self.activation(self.conv_branch(x) + self.shortcut(x))
 
 
+class ChannelAttention(nn.Module):
+    """通道注意力（CBAM 前半）：对特征通道做重要性重标定。
+
+    平均池化与最大池化分别捕获平滑统计与显著峰值，共享一个瓶颈 MLP
+    融合后经 Sigmoid 输出各通道权重。
+    """
+
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        """构建共享瓶颈 MLP。
+
+        Args:
+            channels:  输入通道数。
+            reduction: 瓶颈压缩比，隐藏层宽度为 ``max(channels // reduction, 8)``。
+        """
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """计算通道权重并重标定特征。
+
+        Args:
+            x: 输入特征 ``(B, C, H, W)``。
+
+        Returns:
+            torch.Tensor: 重标定后的特征 ``(B, C, H, W)``。
+        """
+        # 两种全局池化共享同一 MLP：相加融合后映射为逐通道权重。
+        weight = torch.sigmoid(
+            self.mlp(x.mean(dim=(2, 3))) + self.mlp(x.amax(dim=(2, 3)))
+        )
+        return x * weight[:, :, None, None]
+
+
+class SpatialAttention(nn.Module):
+    """空间注意力（CBAM 后半）：对特征空间位置做重要性重标定。
+
+    沿通道维取平均与最大两张空间图，拼接后经卷积 + Sigmoid 输出
+    各位置权重，聚焦细胞区域、组织边界等高响应结构。
+    """
+
+    def __init__(self, kernel_size: int = 7) -> None:
+        """构建空间权重卷积。
+
+        Args:
+            kernel_size: 卷积核尺寸（奇数），padding 取对称半宽。
+        """
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """计算空间权重并重标定特征。
+
+        Args:
+            x: 输入特征 ``(B, C, H, W)``。
+
+        Returns:
+            torch.Tensor: 重标定后的特征 ``(B, C, H, W)``。
+        """
+        spatial = torch.cat(
+            [x.mean(dim=1, keepdim=True), x.amax(dim=1, keepdim=True)], dim=1
+        )
+        weight = torch.sigmoid(self.conv(spatial))
+        return x * weight
+
+
+class CBAM(nn.Module):
+    """CBAM 注意力：通道注意力 -> 空间注意力 串联。
+
+    轻量设计（无全局自注意力大矩阵），适合插入深层特征，
+    以极小开销换取对关键结构的选择性增强。
+    """
+
+    def __init__(self, channels: int, reduction: int = 16, kernel_size: int = 7) -> None:
+        """串联通道与空间注意力。
+
+        Args:
+            channels:    特征通道数。
+            reduction:   通道注意力瓶颈压缩比。
+            kernel_size: 空间注意力卷积核尺寸。
+        """
+        super().__init__()
+        self.channel = ChannelAttention(channels, reduction)
+        self.spatial = SpatialAttention(kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """先通道后空间依次重标定。
+
+        Args:
+            x: 输入特征 ``(B, C, H, W)``。
+
+        Returns:
+            torch.Tensor: 重标定后的特征 ``(B, C, H, W)``。
+        """
+        return self.spatial(self.channel(x))
+
+
 class Down(nn.Module):
-    """下采样模块：2 倍池化 + 卷积块。"""
+    """下采样模块：2 倍池化 + 卷积块（可选残差 / CBAM 注意力）。"""
 
     def __init__(
-        self, in_channels: int, out_channels: int, residual: bool = False
+        self,
+        in_channels: int,
+        out_channels: int,
+        residual: bool = False,
+        attention: bool = False,
     ) -> None:
         """构建下采样路径。
 
@@ -111,10 +217,17 @@ class Down(nn.Module):
             in_channels:  输入通道数。
             out_channels: 输出通道数。
             residual:     是否使用残差块替代普通卷积块。
+            attention:    是否在卷积块后插入 CBAM（建议仅深层启用以控制开销）。
         """
         super().__init__()
         conv = ResidualBlock if residual else DoubleConv
-        self.block = nn.Sequential(nn.MaxPool2d(2, stride=2), conv(in_channels, out_channels))
+        layers: List[nn.Module] = [
+            nn.MaxPool2d(2, stride=2),
+            conv(in_channels, out_channels),
+        ]
+        if attention:
+            layers.append(CBAM(out_channels))
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """空间尺寸减半、通道数调整。
@@ -137,6 +250,7 @@ class Up(nn.Module):
         skip_channels: int,
         out_channels: int,
         residual: bool = False,
+        attention: bool = False,
     ) -> None:
         """构建上采样路径。
 
@@ -145,13 +259,18 @@ class Up(nn.Module):
             skip_channels: 跳跃连接（编码器同层）的通道数。
             out_channels:  输出通道数。
             residual:      是否使用残差块。
+            attention:     是否在卷积块后插入 CBAM（建议仅深层启用）。
         """
         super().__init__()
         self.up = nn.ConvTranspose2d(
             in_channels, in_channels // 2, kernel_size=2, stride=2
         )
         conv = ResidualBlock if residual else DoubleConv
-        self.conv = conv(in_channels // 2 + skip_channels, out_channels)
+        conv_block: nn.Module = conv(in_channels // 2 + skip_channels, out_channels)
+        # 深层解码器可选插入 CBAM：与编码器侧对称，聚焦高响应结构。
+        self.conv = (
+            nn.Sequential(conv_block, CBAM(out_channels)) if attention else conv_block
+        )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         """先升尺度再与跳跃连接融合。
@@ -675,6 +794,115 @@ class AdapterUNet(nn.Module):
         return (output, shared_feature) if self.return_shared else output
 
 
+class ConditionalResAttentionUNet(nn.Module):
+    """多尺度残差注意力条件 U-Net（V3 主力模型）。
+
+    在 ``ConditionalUNetV2`` 的「全尺度 FiLM 标记条件注入」基础上升级：
+
+    - 编码器/解码器卷积块全部替换为残差块：任务本质是由 DAPI 恢复 IHC
+      的配对图像重建，残差连接保留原始空间信息，利于 SSIM/PSNR 像素对齐；
+    - 深层特征（通道数达到 ``base_channels << attn_start``）插入轻量
+      CBAM 注意力（通道 + 空间），聚焦细胞区域、组织边界等高响应结构，
+      浅层保持无注意力以控制计算与显存开销；
+    - FiLM 条件注入保持 V2 口径：scale/shift 初始化为恒等映射，训练稳定。
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 1,
+        base_channels: int = 64,
+        depth: int = 4,
+        num_markers: int = len(MARKERS),
+        embed_dim: int = 128,
+        attn_start: int = 2,
+        cbam_reduction: int = 16,
+        cbam_kernel: int = 7,
+    ) -> None:
+        """搭建残差注意力条件 U-Net。
+
+        Args:
+            in_channels:   输入通道数（DAPI 为 3，启用上下文输入为 6）。
+            out_channels:  输出通道数（目标标记灰度图为 1）。
+            base_channels: 第一层特征宽度。
+            depth:         下采样次数。
+            num_markers:   标记类别数。
+            embed_dim:     marker 嵌入维度，供各层 FiLM 共享。
+            attn_start:    CBAM 启用阈值：特征通道数达到 ``base_channels << attn_start``
+                的层起插入注意力（含瓶颈），浅层不插入。
+            cbam_reduction: CBAM 通道注意力的瓶颈压缩比。
+            cbam_kernel:   CBAM 空间注意力的卷积核尺寸。
+        """
+        super().__init__()
+        self.depth = depth
+        self.embed_dim = embed_dim
+
+        # Marker 嵌入表：将离散 marker_idx 映射为连续向量（与 V2 一致）。
+        self.marker_embedding = nn.Embedding(num_markers, embed_dim)
+        nn.init.normal_(self.marker_embedding.weight, std=0.02)
+
+        # ---- 编码器：残差卷积 + 深层 CBAM，每层后接 FiLM 条件调制 ----
+        self.stem = DoubleConv(in_channels, base_channels)
+        self.stem_film = FiLM(base_channels, embed_dim)
+
+        self.encoders = nn.ModuleList()
+        self.encoder_films = nn.ModuleList()
+        for i in range(depth):
+            self.encoders.append(
+                Down(
+                    base_channels << i,
+                    base_channels << (i + 1),
+                    residual=True,
+                    attention=(i + 1) >= attn_start,
+                )
+            )
+            self.encoder_films.append(FiLM(base_channels << (i + 1), embed_dim))
+
+        # ---- 瓶颈：最深层 Down 已含残差与 CBAM，此处仅注入 FiLM 条件 ----
+        self.bottleneck_film = FiLM(base_channels << depth, embed_dim)
+
+        # ---- 解码器：与编码器对称的残差 + 深层 CBAM + FiLM ----
+        self.decoders = nn.ModuleList()
+        self.decoder_films = nn.ModuleList()
+        for i in reversed(range(depth)):
+            self.decoders.append(
+                Up(
+                    in_channels=base_channels << (i + 1),
+                    skip_channels=base_channels << i,
+                    out_channels=base_channels << i,
+                    residual=True,
+                    attention=i >= attn_start,
+                )
+            )
+            self.decoder_films.append(FiLM(base_channels << i, embed_dim))
+
+        self.head = nn.Conv2d(base_channels, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, marker_idx: torch.Tensor) -> torch.Tensor:
+        """条件前向传播。
+
+        Args:
+            x:          输入 DAPI 图像 ``(B, C_in, H, W)``。
+            marker_idx: 目标标记编号 ``(B,)``，整型。
+
+        Returns:
+            torch.Tensor: 指定标记的生成图像 ``(B, C_out, H, W)``，取值 ``[0, 1]``。
+        """
+        marker_embed = self.marker_embedding(marker_idx)
+
+        feature = self.stem_film(self.stem(x), marker_embed)
+        skips: List[torch.Tensor] = [feature]
+        for encoder, film in zip(self.encoders, self.encoder_films):
+            feature = film(encoder(feature), marker_embed)
+            skips.append(feature)
+
+        # 瓶颈 FiLM 条件注入后，逐级上采样并与跳跃连接融合。
+        feature = self.bottleneck_film(skips.pop(), marker_embed)
+        for decoder, film in zip(self.decoders, self.decoder_films):
+            feature = film(decoder(feature, skips.pop()), marker_embed)
+        return torch.sigmoid(self.head(feature))
+
+
 # ------------------------------------------------------------------ #
 # 统一入口
 # ------------------------------------------------------------------ #
@@ -685,12 +913,19 @@ class ModelRegistry:
         "unet": UNet,
         "resnet_unet": ResNetUNet,
         "conditional_unet": ConditionalUNet,       # 原版：仅 bottleneck 条件
-        "conditional_unet_v2": ConditionalUNetV2,  # 新版：Multi-scale FiLM
+        "conditional_unet_v2": ConditionalUNetV2,  # V2：Multi-scale FiLM
         "adapter_unet": AdapterUNet,               # 共享编码器 + Marker Adapter
+        # V3 主力：残差 + 深层 CBAM + Multi-scale FiLM
+        "conditional_unet_v3": ConditionalResAttentionUNet,
     }
 
     # 需要 marker_idx 输入（一对多联合建模）的模型类型。
-    CONDITIONAL_TYPES = {"conditional_unet", "conditional_unet_v2", "adapter_unet"}
+    CONDITIONAL_TYPES = {
+        "conditional_unet",
+        "conditional_unet_v2",
+        "adapter_unet",
+        "conditional_unet_v3",
+    }
 
     @classmethod
     def build(cls, config: Dict[str, Any]) -> nn.Module:

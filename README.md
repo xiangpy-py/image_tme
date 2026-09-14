@@ -96,7 +96,7 @@ data / utils  <-  train  <-  layout  <-  allocate  <-  operate  ->  feedback
 | | `DataLoaders` | 训练/验证/测试 DataLoader 并行调优（workers/prefetch/persistent） |
 | | `DoubleConv` / `ResidualBlock` / `Down` / `Up` / `MarkerEmbedding` | 网络基础构件 |
 | | `UNet` / `ResNetUNet` | 单标记模型（基线 / ImageNet 预训练编码器） |
-| | `ConditionalUNet` / `ConditionalUNetV2` / `AdapterUNet` | 一对多条件模型（瓶颈嵌入 / 多尺度 FiLM / 共享编码器+标记适配器） |
+| | `ConditionalUNet` / `ConditionalUNetV2` / `AdapterUNet` / `ConditionalResAttentionUNet` | 一对多条件模型（瓶颈嵌入 / 多尺度 FiLM / 共享编码器+标记适配器 / 残差+深层CBAM+FiLM） |
 | | `ModelRegistry` | 按 `model.type` 实例化模型、判断是否条件模型 |
 | | `SSIM` / `SSIMLoss` / `SobelEdgeLoss` / `CrossMarkerConsistencyLoss` / `CombinedLoss` | 损失项与加权组合（`CombinedLoss.from_config`） |
 | | `Metrics` / `MetricAccumulator` / `AverageMeter` | SSIM / PSNR / 比赛综合得分与累计统计 |
@@ -230,7 +230,7 @@ uv run main.py ensemble --config <FILE> --exps NAME [NAME ...]
 | | `num_workers` | DataLoader 进程数；留空按 CPU 核心数自动探测 |
 | | `cache` | 是否内存缓存解码后的图像（大内存机器建议开启） |
 | | `prefetch_factor` | 每个 worker 预取的 batch 数 |
-| `model` | `type` | `unet` / `resnet_unet` / `conditional_unet` / `conditional_unet_v2` / `adapter_unet` |
+| `model` | `type` | `unet` / `resnet_unet` / `conditional_unet` / `conditional_unet_v2` / `adapter_unet` / `conditional_unet_v3` |
 | | 其余字段 | 各模型构造参数，如 `in_channels` / `out_channels` / `base_channels` / `depth` / `num_markers` / `embed_dim` / `return_shared` / `backbone` / `pretrained` |
 | `loss` | `lambda_l1` / `lambda_ssim` | L1 与 SSIM 损失权重 |
 | | `lambda_edge` / `edge_kernel_size` / `edge_smooth_sigma` | 边缘损失权重与 Sobel/高斯参数 |
@@ -313,6 +313,7 @@ data/
 | ResNet-UNet | `resnet_unet` | ImageNet 预训练 ResNet 编码器 + U-Net 解码器 |
 | ConditionalUNet | `conditional_unet` | 一对多：瓶颈注入 marker 嵌入 |
 | ConditionalUNetV2 | `conditional_unet_v2` | 一对多：多尺度 FiLM 逐层注入 |
+| ConditionalResAttentionUNet | `conditional_unet_v3` | 一对多：残差块 + 深层 CBAM 注意力 + 多尺度 FiLM（主力） |
 | AdapterUNet | `adapter_unet` | 一对多：共享编解码器 + 标记适配器，可配跨标记一致性 |
 
 训练要点：

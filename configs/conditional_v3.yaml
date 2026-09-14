@@ -1,0 +1,74 @@
+# 实验 010：多尺度残差注意力条件 U-Net（V3 主力模型，冲榜版本）
+# 结构：Residual Down/Up + 深层 CBAM 注意力 + 全尺度 FiLM 标记条件。
+# 思路：
+#   1. 任务本质是「由 DAPI 恢复 IHC」的配对图像重建，残差连接保留原始
+#      空间信息；CBAM 只放深层聚焦细胞区域/组织边界，控制开销；
+#   2. 损失直接对齐评分口径（Score = 70%·SSIM + 30%·PSNR）：
+#      L1 保颜色/抑制离群 + MSE 精确代理 PSNR + SSIM 主指标 +
+#      Sobel 梯度防边界模糊，权重 0.35 / 0.20 / 0.35 / 0.10。
+#
+# 用法：uv run main.py train --config configs/conditional_v3.yaml
+# 加入实验矩阵：在 configs/experiment_matrix.yaml 的 experiments 节追加
+#   - name: p11_resattn_v3
+#     base: configs/conditional_v3.yaml
+
+experiment:
+  name: exp010_conditional_v3
+
+data:
+  root: data              # 数据根目录，兼容 data/train 与 data/<organ>/train
+  split_dir: data/splits  # ROI 划分目录，先执行: uv run main.py split
+  num_workers: 8          # 数据加载进程数，留空按 CPU 核心数自动探测
+  cache: true             # 内存缓存解码图像，免去每 epoch 重复解码 JPG
+  # context_dir: data/context  # 可选：先 uv run main.py context --scale 2 生成，
+  #                             # 并把下方 in_channels 改为 6 启用上下文输入
+
+model:
+  type: conditional_unet_v3  # 可选值见 src/train/models.py 的 ModelRegistry
+  in_channels: 3             # 启用上下文输入时改为 6（DAPI + context 通道拼接）
+  out_channels: 1
+  base_channels: 64
+  depth: 4
+  num_markers: 4             # CD68 / CD45RO / HLA-DR / Vimentin
+  embed_dim: 128             # marker 嵌入维度，供各层 FiLM 共享
+  attn_start: 2              # 通道数达到 base<<2 即 256 起启用 CBAM（仅深层）
+  cbam_reduction: 16         # CBAM 通道注意力瓶颈压缩比
+  cbam_kernel: 7             # CBAM 空间注意力卷积核尺寸
+
+loss:
+  lambda_l1: 0.35            # 整体颜色/结构，抑制离群值
+  lambda_mse: 0.20           # PSNR 的精确代理（占综合分 30%）
+  lambda_ssim: 0.35          # 比赛主指标（占综合分 70%）
+  lambda_edge: 0.10          # Sobel 梯度损失，防止细胞/组织边界模糊（过重会掉分）
+  edge_kernel_size: 3
+  edge_smooth_sigma: 1.0
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  brightness: 0.1
+  contrast: 0.1
+  noise_std: 0.01
+
+training:
+  epochs: 150
+  batch_size: 32
+  lr: 2.0e-4                 # 残差+注意力网络可用略高学习率
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  scheduler: cosine          # cosine / onecycle
+  ema: true                  # 权重滑动平均
+  ema_eval_every: 5          # EMA 权重每 5 轮评估一次，降低验证开销
+  amp: true                  # 混合精度，仅 CUDA 生效
+  compile: true              # torch.compile 图优化，仅 CUDA 生效
+
+inference:
+  output_dir: results
+  suffix: _fake
+  tta: true                  # 测试时增强（8 视几何等价平均），提交流建议开启
+
+runtime:
+  device: auto               # auto / cpu / cuda / cuda:0
+  seed: 42
+  deterministic: false       # false 启用 cuDNN 自动调优，训练更快

@@ -24,6 +24,7 @@ from .losses import (
 from .metrics import AverageMeter, MetricAccumulator, Metrics
 from .models import (
     AdapterUNet,
+    ConditionalResAttentionUNet,
     ConditionalUNet,
     ConditionalUNetV2,
     ModelRegistry,
@@ -43,6 +44,7 @@ __all__ = [
     "ConditionalUNet",
     "ConditionalUNetV2",
     "AdapterUNet",
+    "ConditionalResAttentionUNet",
     "ModelRegistry",
     # 损失
     "SSIM",
