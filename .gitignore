@@ -18,6 +18,4 @@ wheels/
 
 /data.tar.gz
 /results/
-/train.sh
-/sync.sh
-/wait_and_shutdown.sh
+
