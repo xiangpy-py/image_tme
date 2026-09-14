@@ -1,26 +1,27 @@
-# 实验 001：U-Net 基线
-# 目标：验证「数据 -> 训练 -> 验证 -> 推理」完整链路。
+# 实验 004：多标记条件联合生成（一对多，瓶颈注入）
+# 目标：DAPI + Marker Token -> 统一模型，一次训练覆盖四种标记，
+#       对应赛题「一对多联合建模」创新加分项。
 
 experiment:
-  name: exp001_unet_baseline
+  name: exp004_multi_marker
 
 data:
   root: data              # 数据根目录，兼容 data/train 与 data/<organ>/train
-  marker: CD68            # 单标记目标：CD68 / CD45RO / HLA-DR / Vimentin
   split_dir: data/splits  # ROI 划分目录，先执行: uv run main.py split
-  num_workers: 12         # 数据加载进程数，留空按 CPU 核心数自动探测
+  num_workers: 8          # 数据加载进程数，留空按 CPU 核心数自动探测
   cache: true             # 内存缓存解码图像，免去每 epoch 重复解码 JPG
+  # 条件模型无需 data.marker，训练时随机采样目标标记
 
 model:
-  type: unet              # 可选值见 src/train/models.py 的 ModelRegistry
+  type: conditional_unet  # 可选值见 src/train/models.py 的 ModelRegistry
   in_channels: 3
   out_channels: 1
   base_channels: 64
   depth: 4
+  num_markers: 4          # CD68 / CD45RO / HLA-DR / Vimentin
 
 loss:
   lambda_l1: 1.0
-  lambda_mse: 0.0           # MSE 是 PSNR 的直接代理（占综合分 30%），建议试 1.0~2.0
   lambda_ssim: 1.0
 
 augmentation:
@@ -32,8 +33,8 @@ augmentation:
   noise_std: 0.01
 
 training:
-  epochs: 100
-  batch_size: 64
+  epochs: 150             # 多任务共享参数，适当增加训练轮数
+  batch_size: 32
   lr: 1.0e-4
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
@@ -43,7 +44,6 @@ training:
 inference:
   output_dir: results
   suffix: _fake
-  tta: false              # 测试时增强（4 旋转 × 2 翻转取平均），提交流建议开启
 
 runtime:
   device: auto            # auto / cpu / cuda / cuda:0

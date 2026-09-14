@@ -1,0 +1,67 @@
+# 实验 008：两阶段微调（第二阶段：MSE + SSIM 像素级微调）
+# 思路（Marker-wise Diffusion 论文表 4 的核心证据）：
+#   第一阶段用 L1+SSIM 把模型训到收敛，第二阶段加载其 best.pth，
+#   以低学习率切换为 MSE+SSIM 为主的损失短程微调——
+#   MSE 是评测指标 PSNR 的精确代理（占综合分 30%），直接对齐评分口径。
+#
+# 用法：复制本配置，修改 experiment.name 与 training.init_from 指向
+#       第一阶段实验的 best.pth（model 一节必须与源实验完全一致）：
+#   uv run main.py train --config configs/finetune_mse.yaml
+#       --init-from checkpoints/exp006_conditional_v2/best.pth
+
+experiment:
+  name: exp008_conditional_v2_finetune
+
+data:
+  root: data
+  split_dir: data/splits
+  num_workers: 8
+  cache: true
+
+model:
+  type: conditional_unet_v2  # 必须与 init_from 源实验的结构完全一致
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  depth: 4
+  num_markers: 4
+  embed_dim: 128
+
+loss:
+  lambda_l1: 0.5            # 保留少量 L1 维持边缘锐度
+  lambda_mse: 2.0           # 第二阶段主力项：直接优化 PSNR
+  lambda_ssim: 1.0
+  lambda_edge: 0.5
+  edge_kernel_size: 3
+  edge_smooth_sigma: 1.0
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  brightness: 0.05          # 微调阶段减弱光度扰动，贴合真实分布
+  contrast: 0.05
+  noise_std: 0.005
+
+training:
+  epochs: 20                # 短程微调即可，过长会抹掉第一阶段的结构收益
+  batch_size: 32
+  lr: 1.0e-5                # 比第一阶段低一个量级
+  min_lr: 1.0e-7
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  init_from: ""             # 第一阶段 best.pth 路径，也可用 --init-from 覆盖
+  ema: true
+  ema_eval_every: 1         # 微调轮次少，每轮都评估 EMA
+  amp: true
+  compile: true
+
+inference:
+  output_dir: results
+  suffix: _fake
+  tta: true                 # 提交流开启测试时增强
+
+runtime:
+  device: auto
+  seed: 42
+  deterministic: false

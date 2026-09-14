@@ -1,27 +1,30 @@
-# 实验 001：U-Net 基线
-# 目标：验证「数据 -> 训练 -> 验证 -> 推理」完整链路。
+# 实验 006：多尺度条件 U-Net（FiLM）
+# 目标：在编码器/解码器各层注入 marker 条件，提升标记特异性。
 
 experiment:
-  name: exp001_unet_baseline
+  name: exp006_conditional_v2
 
 data:
   root: data              # 数据根目录，兼容 data/train 与 data/<organ>/train
-  marker: CD68            # 单标记目标：CD68 / CD45RO / HLA-DR / Vimentin
   split_dir: data/splits  # ROI 划分目录，先执行: uv run main.py split
-  num_workers: 12         # 数据加载进程数，留空按 CPU 核心数自动探测
+  num_workers: 8          # 数据加载进程数，留空按 CPU 核心数自动探测
   cache: true             # 内存缓存解码图像，免去每 epoch 重复解码 JPG
 
 model:
-  type: unet              # 可选值见 src/train/models.py 的 ModelRegistry
+  type: conditional_unet_v2  # 可选值见 src/train/models.py 的 ModelRegistry
   in_channels: 3
   out_channels: 1
   base_channels: 64
   depth: 4
+  num_markers: 4          # CD68 / CD45RO / HLA-DR / Vimentin
+  embed_dim: 128          # marker 嵌入维度，供各层 FiLM 共享
 
 loss:
   lambda_l1: 1.0
-  lambda_mse: 0.0           # MSE 是 PSNR 的直接代理（占综合分 30%），建议试 1.0~2.0
   lambda_ssim: 1.0
+  lambda_edge: 0.5        # 边缘损失，约束细胞/组织边界结构
+  edge_kernel_size: 3
+  edge_smooth_sigma: 1.0
 
 augmentation:
   hflip_prob: 0.5
@@ -32,18 +35,20 @@ augmentation:
   noise_std: 0.01
 
 training:
-  epochs: 100
-  batch_size: 64
+  epochs: 150
+  batch_size: 32
   lr: 1.0e-4
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
+  scheduler: cosine       # cosine / onecycle
+  ema: true               # 权重滑动平均
+  ema_eval_every: 5       # EMA 权重每 5 轮评估一次，降低验证开销
   amp: true               # 混合精度，仅 CUDA 生效
   compile: true           # torch.compile 图优化，仅 CUDA 生效
 
 inference:
   output_dir: results
   suffix: _fake
-  tta: false              # 测试时增强（4 旋转 × 2 翻转取平均），提交流建议开启
 
 runtime:
   device: auto            # auto / cpu / cuda / cuda:0
