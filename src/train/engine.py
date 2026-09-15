@@ -847,6 +847,7 @@ class MarkerEvaluator:
         model: nn.Module,
         loader: DataLoader,
         marker_idx: Optional[int] = None,
+        desc: str = "eval",
     ) -> Dict[str, float]:
         """在一个标记的验证集上累计指标。
 
@@ -854,13 +855,16 @@ class MarkerEvaluator:
             model:      已加载权重的模型。
             loader:     该标记的验证集 DataLoader。
             marker_idx: 条件模型的标记编号；单标记模型传 ``None``。
+            desc:       进度条描述文字，用于区分当前评估的标记。
 
         Returns:
             Dict[str, float]: 含 ``ssim`` / ``psnr`` / ``score``。
         """
         model.eval()
         accumulator = MetricAccumulator()
-        for batch in loader:
+        # 全量验证集叠加 TTA 后单个标记即需一分多钟，必须给出进度反馈，
+        # 否则终端长时间静默会被误判为进程卡死。
+        for batch in tqdm(loader, desc=desc):
             inputs = batch["input"].to(self.device, non_blocking=True)
             targets = batch["target"].to(self.device, non_blocking=True)
             idx_tensor = (
@@ -919,7 +923,9 @@ class MarkerEvaluator:
                 idx = None
 
             loader = DataLoaders.for_validation_marker(self.config, marker)
-            report[marker] = self._evaluate_loader(model, loader, marker_idx=idx)
+            report[marker] = self._evaluate_loader(
+                model, loader, marker_idx=idx, desc=f"eval [{marker}]"
+            )
             self.logger.info(
                 f"[{marker}] SSIM={report[marker]['ssim']:.4f} | "
                 f"PSNR={report[marker]['psnr']:.2f} | Score={report[marker]['score']:.4f}"
