@@ -54,7 +54,7 @@ augmentation:
 training:
   epochs: 150
   batch_size: 32
-  lr: 2.0e-4                 # 残差+注意力网络可用略高学习率
+  lr: 1.0e-4                # 与 V2 一致；2e-4 会在首个 epoch 内塌缩到暗图死区（实测）
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
   scheduler: cosine          # cosine / onecycle
