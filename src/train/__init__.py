@@ -17,9 +17,11 @@ from .engine import MarkerEvaluator, Predictor, Trainer
 from .losses import (
     CombinedLoss,
     CrossMarkerConsistencyLoss,
+    GradientDifferenceLoss,
     SSIM,
     SSIMLoss,
     SobelEdgeLoss,
+    TVLoss,
 )
 from .metrics import AverageMeter, MetricAccumulator, Metrics
 from .models import (
@@ -50,6 +52,7 @@ __all__ = [
     "SSIM",
     "SSIMLoss",
     "SobelEdgeLoss",
+    "GradientDifferenceLoss",
     "TVLoss",
     "CrossMarkerConsistencyLoss",
     "CombinedLoss",
@@ -60,4 +63,5 @@ __all__ = [
     # 引擎
     "Trainer",
     "Predictor",
+    "MarkerEvaluator",
 ]
