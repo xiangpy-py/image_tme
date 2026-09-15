@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from ..data.alignment import AlignmentMap
 from ..data.constants import MARKERS, SOURCE_MARKER
 from ..data.dataset import DatasetSource, DatasetSplitter
 from .models import ModelRegistry
@@ -255,6 +256,7 @@ class VirtualStainingDataset(Dataset):
         file_list: Optional[List[str]] = None,
         cache: bool = False,
         context_root: Optional[str] = None,
+        alignment: Optional[AlignmentMap] = None,
     ) -> None:
         """收集 DAPI 与目标标记的同名配对样本。
 
@@ -268,6 +270,8 @@ class VirtualStainingDataset(Dataset):
             cache:        是否在内存中缓存全部解码图像（大内存机器建议开启）。
             context_root: 多尺度上下文图根目录（由 ContextGenerator 生成），
                 ``None`` 表示不使用上下文输入。
+            alignment:    配准校正表（由 ``align`` 命令生成），``None`` 表示
+                不做目标图平移校正。
 
         Raises:
             ValueError:       标记名非法或未找到任何配对样本时抛出。
@@ -279,6 +283,7 @@ class VirtualStainingDataset(Dataset):
 
         self.marker = marker
         self.transform = transform
+        self.alignment = alignment
         self._root_path = Path(root)
         self.context_root = Path(context_root) if context_root else None
         # (源图路径, 真值路径或 None[测试模式], 上下文路径或 None[未启用])，
@@ -387,6 +392,13 @@ class VirtualStainingDataset(Dataset):
                 else None
             )
 
+        # 配准校正必须在增强之前：把目标图平移回与 DAPI 对齐，
+        # 之后的几何增强对两者同步施加，不会破坏对齐关系。
+        if self.alignment is not None and target is not None:
+            shift = self.alignment.get(source_path.stem, self.marker)
+            if shift is not None:
+                target = AlignmentMap.apply(target, shift[0], shift[1])
+
         if self.transform is not None:
             image, target, context = self.transform(image, target, context)
 
@@ -442,6 +454,7 @@ class MultiMarkerDataset(Dataset):
         random_marker: bool = True,
         marker_weights: Optional[Dict[str, float]] = None,
         context_root: Optional[str] = None,
+        alignment: Optional[AlignmentMap] = None,
     ) -> None:
         """收集同时存在全部目标标记真值的样本。
 
@@ -461,6 +474,8 @@ class MultiMarkerDataset(Dataset):
                 未列出的标记取 1.0，``None`` 表示等概率采样。四标记取平均
                 计分的赛制下，对弱势标记加权可提升其梯度占比。
             context_root: 多尺度上下文图根目录，``None`` 表示不使用。
+            alignment:    配准校正表（由 ``align`` 命令生成），``None`` 表示
+                不做目标图平移校正。
 
         Raises:
             ValueError:       未找到任何全配对样本时抛出。
@@ -469,6 +484,7 @@ class MultiMarkerDataset(Dataset):
         super().__init__()
         self.markers = markers or list(MARKERS)
         self.transform = transform
+        self.alignment = alignment
         self.random_marker = random_marker
         self.marker_probs = self._resolve_marker_probs(marker_weights)
         root_path = Path(root)
@@ -602,6 +618,12 @@ class MultiMarkerDataset(Dataset):
                 else None
             )
 
+        # 配准校正必须在增强之前（与单标记数据集同一口径）。
+        if self.alignment is not None:
+            shift = self.alignment.get(name, marker)
+            if shift is not None:
+                target = AlignmentMap.apply(target, shift[0], shift[1])
+
         if self.transform is not None:
             image, target, context = self.transform(image, target, context)
 
@@ -676,6 +698,10 @@ class DataLoaders:
         context_root = data_cfg.get("context_dir") or None
         # 标记采样权重：仅训练集生效，验证集按样本下标确定性轮转标记。
         marker_weights = data_cfg.get("marker_weights") or None
+        # 配准校正：仅作用于训练集。验证集保持与赛方一致的原始真值，
+        # 使验证指标仍反映线上口径（模型选择不被校正口径带偏）。
+        alignment_file = data_cfg.get("alignment_file") or None
+        alignment = AlignmentMap.load(alignment_file) if alignment_file else None
 
         # ROI 划分文件必须存在：否则训练集与验证集会退化为同一份数据，
         # 造成严重的信息泄漏（验证指标虚高）。此处快速失败并提示修复方式。
@@ -696,6 +722,7 @@ class DataLoaders:
                     cache=cache,
                     marker_weights=marker_weights,
                     context_root=context_root,
+                    alignment=alignment,
                 ),
                 MultiMarkerDataset(
                     root=root,
@@ -716,6 +743,7 @@ class DataLoaders:
                 file_list=train_list,
                 cache=cache,
                 context_root=context_root,
+                alignment=alignment,
             ),
             VirtualStainingDataset(
                 root=root,

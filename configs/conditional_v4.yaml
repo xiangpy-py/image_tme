@@ -1,0 +1,81 @@
+# 实验 011：timm 预训练编码器条件 U-Net（V4 冲榜模型）
+# 相对 V3 的三处升级（对应优化路线第 0/1/3 层）：
+#   1. 编码器：ConvNeXt-Tiny ImageNet 预训练主干（赛题允许公开预训练
+#      权重），特征表征远强于 1.2 万 patch 从零训练；首次运行需联网
+#      下载权重（约 100MB，之后走本地缓存）。
+#   2. 损失：针对「预测过度平滑（TV 仅为真值 1/3）」重调权重——
+#      提高 SSIM 主指标权重、降低 L1（平滑偏置来源）、新增 GDL 梯度差
+#      损失直接惩罚梯度幅值差，逼出纹理强度。
+#   3. 评测口径：验证 SSIM 切换为 skimage 默认参数（赛方评测大概率
+#      口径），保证 best.pth 是赛方口径下的最优点；PSNR 归一化上界
+#      已按与赛方比对结果修正为 50dB（src/train/metrics.py）。
+#
+# 用法：uv run main.py train --config configs/conditional_v4.yaml
+# 可选增强：
+#   - 先执行 `uv run main.py context` 生成上下文图，再把 context_dir
+#     与 in_channels=6 打开（多尺度上下文输入）；
+#   - 先执行 `uv run main.py align` 生成校正表，再打开 alignment_file
+#     （训练集目标图平移校正，验证集保持赛方原始口径）。
+
+experiment:
+  name: exp011_conditional_v4
+
+data:
+  root: data              # 数据根目录，兼容 data/train 与 data/<organ>/train
+  split_dir: data/splits  # ROI 划分目录，先执行: uv run main.py split
+  num_workers: 8
+  cache: true
+  # context_dir: data/context    # 可选：多尺度上下文（需 in_channels 改 6）
+  # alignment_file: data/alignment.json  # 可选：配准校正表（先 align 生成）
+
+model:
+  type: conditional_unet_v4
+  in_channels: 3             # 启用上下文输入时改为 6
+  out_channels: 1
+  backbone: convnext_tiny    # 可换 resnet34 / efficientnet_b3 等 timm 主干
+  pretrained: true
+  num_markers: 4
+  embed_dim: 128
+
+loss:
+  lambda_l1: 0.20            # 降低：L1 的最优解是条件中位数，是平滑偏置主因
+  lambda_mse: 1.0            # PSNR 精确代理（占综合分 30%，归一化上界 50dB）
+  lambda_ssim: 1.0           # 提高：比赛主指标（占 70%），奖励局部对比度匹配
+  lambda_edge: 0.05          # 边缘约束保留但降权，让位给 GDL
+  edge_kernel_size: 3
+  edge_smooth_sigma: 1.0
+  lambda_gdl: 0.10           # 新增：梯度差损失，直接对抗过度平滑
+
+augmentation:
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90: true
+  # 光度扰动保持关闭：本任务为绝对强度回归，实验矩阵已证实开启掉分。
+  brightness: 0.0
+  contrast: 0.0
+  noise_std: 0.0
+
+training:
+  epochs: 300                # 预训练编码器收敛快，但长训仍有益（cosine 到低 lr）
+  batch_size: 16             # ConvNeXt-Tiny 显存占用高于从零 U-Net，按需下调
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  ema: true
+  ema_eval_every: 5
+  amp: true
+  compile: false             # 本机 torch 下 compile+fp16 反向有 NaN（实测），保持关闭
+
+evaluation:
+  ssim_impl: skimage         # 验证/选模 SSIM 对齐赛方口径（skimage 默认参数）
+
+inference:
+  output_dir: results
+  suffix: _fake
+  tta: true                  # 8 视图几何等价平均，提交流建议开启
+
+runtime:
+  device: auto
+  seed: 42
+  deterministic: false

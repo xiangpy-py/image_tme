@@ -5,6 +5,7 @@
     analyze       数据统计分析        -> DatasetAnalyzer.analyze
     split         按 ROI 划分数据集   -> DatasetSplitter.create
     context       多尺度上下文生成    -> ContextGenerator.generate
+    align         配准误差估计        -> AlignmentAnalyzer.analyze
     train         单实验训练          -> Operator.train_experiment
     experiments   实验矩阵赛马        -> Operator.run_experiments
     infer         测试集推理          -> Predictor.run_experiment
@@ -18,7 +19,12 @@
 import argparse
 from typing import Dict
 
-from src.data import ContextGenerator, DatasetAnalyzer, DatasetSplitter
+from src.data import (
+    AlignmentAnalyzer,
+    ContextGenerator,
+    DatasetAnalyzer,
+    DatasetSplitter,
+)
 from src.data.constants import MARKERS
 from src.ensemble import Ensembler
 from src.operate import Operator
@@ -96,6 +102,37 @@ def cmd_context(args: argparse.Namespace) -> None:
     print("训练/推理配置中设置 data.context_dir 为该目录即可启用。")
 
 
+def cmd_align(args: argparse.Namespace) -> None:
+    """配准误差估计：相位相关逐样本估计 DAPI 与各标记的平移量。
+
+    Args:
+        args: 含 ``root`` / ``sample_limit`` / ``max_shift`` / ``output``。
+
+    Returns:
+        None
+    """
+    result = AlignmentAnalyzer.analyze(
+        args.root,
+        sample_limit=args.sample_limit,
+        max_shift=args.max_shift,
+        output=args.output,
+    )
+    print(f"\n{'标记':<12}{'dy均值':<10}{'dx均值':<10}{'|d|的P95':<12}{'有效/跳过'}")
+    print("-" * 60)
+    for marker, stats in result["stats"].items():
+        abs_p95 = max(stats.get("dy_abs_p95", 0.0), stats.get("dx_abs_p95", 0.0))
+        print(
+            f"{marker:<12}{stats.get('dy_mean', 0.0):<10.3f}"
+            f"{stats.get('dx_mean', 0.0):<10.3f}{abs_p95:<12.3f}"
+            f"{stats.get('estimated', 0)}/{stats.get('skipped', 0)}"
+        )
+    print("-" * 60)
+    print(f"校正表已保存: {args.output}")
+    print("训练配置中设置 data.alignment_file 为该文件即可启用目标图平移校正。")
+    print("判读建议：P95 持续 ≥1 像素说明存在系统性错位，值得启用校正；")
+    print("若均值接近 0 且 P95 < 0.5，则配准良好，无需启用。")
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     """单实验训练：解析超参覆盖项后交给操作器执行。
 
@@ -145,16 +182,16 @@ def cmd_infer(args: argparse.Namespace) -> None:
 
 
 def cmd_marker_report(args: argparse.Namespace) -> None:
-    """逐标记短板分析：整理覆盖项后交给逐标记评估器。
+    """逐标记短板分析：把 ``--ckpt-*`` 覆盖项整理后交给逐标记评估器。
 
     Args:
-        args: 含 ``config`` / ``exp`` / ``online`` 与各标记 checkpoint 覆盖项。
+        args: 含 ``config`` / ``exp`` / 各标记 checkpoint 覆盖项。
 
     Returns:
         None
     """
     MarkerEvaluator(ConfigManager.load(args.config)).report(
-        args.exp, collect_ckpt_overrides(args), online=args.online
+        args.exp, collect_ckpt_overrides(args)
     )
 
 
@@ -308,6 +345,49 @@ def parse_args() -> argparse.Namespace:
         help="视野倍率：>1 为组织级上下文（默认: 2），<1 为中心细节放大",
     )
     context_parser.set_defaults(func=cmd_context)
+
+    # ---- align ----
+    align_parser = subparsers.add_parser(
+        "align",
+        help="配准误差估计（DAPI 与各标记的平移量）",
+        description=(
+            "用相位相关逐样本估计 DAPI 与各目标标记之间的平移量，"
+            "汇总统计并生成校正表 JSON；训练时设置 data.alignment_file "
+            "即可把目标图平移回与 DAPI 对齐，消除系统性错位对 "
+            "SSIM/PSNR 的硬上限。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  uv run main.py align --root data --sample-limit 500\n"
+            "输出: data/alignment.json（统计 + 逐样本平移向量）"
+        ),
+        formatter_class=FORMATTER,
+    )
+    align_parser.add_argument(
+        "--root", type=str, default="data", metavar="DIR", help="数据根目录（默认: data）"
+    )
+    align_parser.add_argument(
+        "--sample-limit",
+        type=int,
+        default=500,
+        metavar="N",
+        help="每个标记最多抽样的样本数（默认: 500）",
+    )
+    align_parser.add_argument(
+        "--max-shift",
+        type=float,
+        default=8.0,
+        metavar="P",
+        help="可信平移量上限（像素），超过判定为无效估计（默认: 8）",
+    )
+    align_parser.add_argument(
+        "--output",
+        type=str,
+        default="data/alignment.json",
+        metavar="FILE",
+        help="校正表输出路径（默认: data/alignment.json）",
+    )
+    align_parser.set_defaults(func=cmd_align)
 
     # ---- train ----
     train_parser = subparsers.add_parser(
@@ -483,15 +563,12 @@ def parse_args() -> argparse.Namespace:
         description=(
             "在同一验证集上分别评估四种标记（SSIM/PSNR/Score），"
             "按赛题「多输出取平均分」口径标出短板标记，"
-            "供损失权重或采样策略调整参考；"
-            "指标口径已与赛方评分脚本对齐（PSNR 归一化上界 50 dB）。"
+            "供损失权重或采样策略调整参考。"
         ),
         epilog=(
             "示例:\n"
-            "  uv run main.py marker-report --config configs/conditional_v3.yaml --exp exp010_conditional_v3\n"
-            "  # 用赛方反馈校验本地验证集的可信度（会追加 logs/submission_check.csv）\n"
-            "  uv run main.py marker-report --config configs/submit_p10.yaml "
-            "--exp p10_aug_geoonly --online \"指标=CD68:SSIM=0.802,PSNR=25.344;...\""
+            "  uv run main.py marker-report --config configs/baseline.yaml --exp exp001_unet_baseline\n"
+            "  uv run main.py marker-report --config configs/conditional_v2.yaml --exp exp006_conditional_v2"
         ),
         formatter_class=FORMATTER,
     )
@@ -524,16 +601,6 @@ def parse_args() -> argparse.Namespace:
             metavar="FILE",
             help=f"标记 {marker} 的单模型 checkpoint（优先于 --exp）",
         )
-    report_parser.add_argument(
-        "--online",
-        type=str,
-        default=None,
-        metavar="TEXT",
-        help=(
-            "赛方自动评分反馈原文（或存放该文本的文件路径）；提供后额外打印"
-            "「线上 vs 本地」逐标记对照，用于校验本地验证集能否预测线上得分"
-        ),
-    )
     report_parser.set_defaults(func=cmd_marker_report)
 
     # ---- ensemble ----

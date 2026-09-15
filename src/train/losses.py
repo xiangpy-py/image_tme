@@ -2,13 +2,15 @@
 
 组合损失::
 
-    L = λ_l1·L1 + λ_mse·MSE + λ_ssim·SSIM + λ_edge·Edge + λ_cross·CrossMarker + λ_tv·TV
+    L = λ_l1·L1 + λ_mse·MSE + λ_ssim·SSIM + λ_edge·Edge + λ_gdl·GDL
+        + λ_cross·CrossMarker + λ_tv·TV
 
 - ``MSE``：均方误差，是评测指标 PSNR 的精确代理（PSNR 由全局 MSE 单调
   决定，占综合分 30%）；L1 优化中位数而 MSE 优化均值，二者互补；
 - ``SSIM`` / ``SSIMLoss``：结构相似性，比赛主指标之一（占综合分 70%），
   设计为可微损失直接优化；
 - ``SobelEdgeLoss``：约束细胞边界/组织边缘的结构一致性；
+- ``GradientDifferenceLoss``：约束一阶梯度幅值差，对抗回归的平滑偏置；
 - ``TVLoss``：约束生成图的结构变化量（默认与真值对齐），抑制伪影；
 - ``CrossMarkerConsistencyLoss``：一对多建模时约束共享特征与标记无关；
 - ``CombinedLoss``：按权重装配以上分项，权重为 0 即关闭。
@@ -254,6 +256,49 @@ class SobelEdgeLoss(nn.Module):
         return F.l1_loss(pred_edge, target_edge)
 
 
+class GradientDifferenceLoss(nn.Module):
+    """梯度差损失（GDL）：分别约束 x/y 方向一阶梯度幅值的 L1 差。
+
+    设计动机：L1/MSE 损失的最优解是条件中位数/均值，天然偏向平滑输出
+    （本任务实测预测图总变差仅为真值的约 1/3），而 SSIM 的对比度项与
+    结构项都依赖局部纹理强度。Sobel 边缘损失约束的是梯度幅值图本身，
+    GDL 则直接惩罚 ``|∇pred| - |∇target|``，对「边缘位置对但强度偏弱」
+    的模糊解给出更强的梯度信号，是图像重建任务中经典的抗平滑项
+    （Mathieu et al., 2015）。
+    """
+
+    @staticmethod
+    def _gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """计算 x/y 方向一阶差分幅值。
+
+        Args:
+            x: 图像张量 ``(B, C, H, W)``。
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (水平差分幅值, 垂直差分幅值)，
+            空间尺寸分别缩减 1 像素。
+        """
+        grad_x = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs()
+        grad_y = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs()
+        return grad_x, grad_y
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """计算两个方向的梯度幅值 L1 差并取平均。
+
+        Args:
+            pred:   预测图像 ``(B, C, H, W)``，取值 ``[0, 1]``。
+            target: 真值图像，形状与取值同 ``pred``。
+
+        Returns:
+            torch.Tensor: 标量损失，值域 ``[0, +inf)``。
+        """
+        pred_x, pred_y = self._gradients(pred)
+        target_x, target_y = self._gradients(target)
+        return 0.5 * (
+            F.l1_loss(pred_x, target_x) + F.l1_loss(pred_y, target_y)
+        )
+
+
 class TVLoss(nn.Module):
     """总变差（Total Variation）正则：约束生成图的结构变化量并抑制伪影。
 
@@ -385,6 +430,7 @@ class CombinedLoss(nn.Module):
         edge_smooth_sigma: float = 1.0,
         lambda_tv: float = 0.0,
         tv_mode: str = "match",
+        lambda_gdl: float = 0.0,
     ) -> None:
         """按权重装配各分项损失。
 
@@ -398,6 +444,8 @@ class CombinedLoss(nn.Module):
             edge_smooth_sigma: 边缘图高斯平滑标准差，<=0 表示不平滑。
             lambda_tv:         TV 正则权重（0 表示关闭）。
             tv_mode:           TV 模式，``"match"`` 对齐真值 ｜ ``"penalty"`` 最小化预测。
+            lambda_gdl:        梯度差损失权重（0 表示关闭）；抗平滑，
+                与 SSIM 主指标同向，建议 0.05~0.2 区间小步实验。
         """
         super().__init__()
         self.lambda_l1 = lambda_l1
@@ -406,6 +454,7 @@ class CombinedLoss(nn.Module):
         self.lambda_edge = lambda_edge
         self.lambda_cross = lambda_cross
         self.lambda_tv = lambda_tv
+        self.lambda_gdl = lambda_gdl
 
         self.l1 = nn.L1Loss()
         self.mse = nn.MSELoss() if lambda_mse > 0 else None
@@ -420,6 +469,7 @@ class CombinedLoss(nn.Module):
         )
         self.cross = CrossMarkerConsistencyLoss() if lambda_cross > 0 else None
         self.tv = TVLoss(tv_mode) if lambda_tv > 0 else None
+        self.gdl = GradientDifferenceLoss() if lambda_gdl > 0 else None
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "CombinedLoss":
@@ -442,6 +492,7 @@ class CombinedLoss(nn.Module):
             edge_smooth_sigma=float(loss_cfg.get("edge_smooth_sigma", 1.0)),
             lambda_tv=float(loss_cfg.get("lambda_tv", 0.0)),
             tv_mode=str(loss_cfg.get("tv_mode", "match")),
+            lambda_gdl=float(loss_cfg.get("lambda_gdl", 0.0)),
         )
 
     def forward(
@@ -488,6 +539,11 @@ class CombinedLoss(nn.Module):
             tv_value = self.tv(pred, target)
             total = total + self.lambda_tv * tv_value
             details["tv"] = float(tv_value.detach())
+
+        if self.gdl is not None:
+            gdl_value = self.gdl(pred, target)
+            total = total + self.lambda_gdl * gdl_value
+            details["gdl"] = float(gdl_value.detach())
 
         if self.cross is not None and aux is not None:
             shared = aux.get("shared_features")

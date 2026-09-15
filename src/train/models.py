@@ -14,6 +14,7 @@
 """
 
 import inspect
+import math
 from typing import Any, Callable, Dict, List, Union
 
 import torch
@@ -903,6 +904,133 @@ class ConditionalResAttentionUNet(nn.Module):
         return torch.sigmoid(self.head(feature))
 
 
+class ConditionalTimmUNet(nn.Module):
+    """timm 预训练编码器 + FiLM 标记条件 U-Net（V4 冲榜模型）。
+
+    相对 V3（从零训练的残差 U-Net）的升级点：
+
+    - 编码器换成 timm 的 ImageNet 预训练主干（默认 ConvNeXt-Tiny，
+      可换 ``resnet34`` / ``efficientnet_b3`` 等任意 ``features_only``
+      支持的主干）：赛题允许公开预训练权重，预训练特征对细胞形态、
+      组织边界的表征远强于 1.2 万 patch 从零学习；
+    - 解码器为 U 型逐级上采样 + 跳跃连接，每个尺度后接 FiLM 标记
+      条件注入（与 V2/V3 同一口径，scale/shift 初始为恒等映射）；
+    - 自动适配主干的下采样倍率：首级 stride>2 时补足全分辨率
+      上采样级，保证输出与输入同尺寸。
+
+    注意：首次使用某主干需联网下载预训练权重（缓存在 torch 目录），
+    离线服务器请提前下载。
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 1,
+        backbone: str = "convnext_tiny",
+        pretrained: bool = True,
+        num_markers: int = len(MARKERS),
+        embed_dim: int = 128,
+    ) -> None:
+        """搭建预训练编码器与条件解码器。
+
+        Args:
+            in_channels:  输入通道数（DAPI 为 3，启用上下文输入为 6）。
+            out_channels: 输出通道数（目标标记灰度图为 1）。
+            backbone:     timm 主干名，需支持 ``features_only=True``。
+            pretrained:   是否加载 ImageNet 预训练权重。
+            num_markers:  标记类别数。
+            embed_dim:    marker 嵌入维度，供各层 FiLM 共享。
+
+        Raises:
+            ImportError: 未安装 timm 时抛出并提示安装方式。
+        """
+        super().__init__()
+        try:
+            import timm
+        except ImportError as error:
+            raise ImportError(
+                "conditional_unet_v4 依赖 timm，请执行 `uv pip install timm`"
+            ) from error
+
+        # ---- 输入适配：in_channels != 3 时以 1x1 卷积升维 ----
+        if in_channels != 3:
+            self.input_adapter = nn.Conv2d(in_channels, 3, kernel_size=1, bias=False)
+            if pretrained:
+                # 小方差初始化，避免适配层干扰预训练特征分布。
+                self.input_adapter.weight.normal_(std=0.01)
+        else:
+            self.input_adapter = nn.Identity()
+
+        # ---- 预训练编码器：features_only 输出各级中间特征 ----
+        self.encoder = timm.create_model(
+            backbone, features_only=True, pretrained=pretrained, in_chans=3
+        )
+        stage_channels: List[int] = list(self.encoder.feature_info.channels())
+        first_reduction: int = int(self.encoder.feature_info.reduction()[0])
+
+        # ---- 标记条件嵌入：供瓶颈与全部解码尺度的 FiLM 共享 ----
+        self.marker_embedding = nn.Embedding(num_markers, embed_dim)
+        nn.init.normal_(self.marker_embedding.weight, std=0.02)
+
+        # ---- 解码器：自最深层逐级上采样并与编码器特征融合 ----
+        self.bottleneck_film = FiLM(stage_channels[-1], embed_dim)
+        self.decoders = nn.ModuleList()
+        self.decoder_films = nn.ModuleList()
+        current_channels = stage_channels[-1]
+        for skip_channels in reversed(stage_channels[:-1]):
+            self.decoders.append(
+                Up(
+                    in_channels=current_channels,
+                    skip_channels=skip_channels,
+                    out_channels=skip_channels,
+                )
+            )
+            self.decoder_films.append(FiLM(skip_channels, embed_dim))
+            current_channels = skip_channels
+
+        # ---- 全分辨率补足：解码器链末端停在最浅层特征的 stride 上
+        # （ConvNeXt 为 4、ResNet 为 2），需补足对应次数的 ×2 上采样，
+        # 保证输出与输入同尺寸。
+        self.final_ups = nn.ModuleList()
+        extra_ups = int(round(math.log2(first_reduction)))
+        for _ in range(max(0, extra_ups)):
+            self.final_ups.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(
+                        current_channels, current_channels, kernel_size=2, stride=2
+                    ),
+                    DoubleConv(current_channels, current_channels),
+                )
+            )
+
+        self.head = nn.Conv2d(current_channels, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, marker_idx: torch.Tensor) -> torch.Tensor:
+        """条件前向传播。
+
+        Args:
+            x:          输入 DAPI 图像 ``(B, C_in, H, W)``。
+            marker_idx: 目标标记编号 ``(B,)``，整型。
+
+        Returns:
+            torch.Tensor: 指定标记的生成图像 ``(B, C_out, H, W)``，取值 ``[0, 1]``。
+        """
+        marker_embed = self.marker_embedding(marker_idx)
+
+        features: List[torch.Tensor] = self.encoder(self.input_adapter(x))
+
+        # 瓶颈 FiLM 条件注入后，逐级上采样 + 跳跃连接 + FiLM。
+        feature = self.bottleneck_film(features[-1], marker_embed)
+        for decoder, film, skip in zip(
+            self.decoders, self.decoder_films, reversed(features[:-1])
+        ):
+            feature = film(decoder(feature, skip), marker_embed)
+
+        for final_up in self.final_ups:
+            feature = final_up(feature)
+        return torch.sigmoid(self.head(feature))
+
+
 # ------------------------------------------------------------------ #
 # 统一入口
 # ------------------------------------------------------------------ #
@@ -917,6 +1045,8 @@ class ModelRegistry:
         "adapter_unet": AdapterUNet,               # 共享编码器 + Marker Adapter
         # V3 主力：残差 + 深层 CBAM + Multi-scale FiLM
         "conditional_unet_v3": ConditionalResAttentionUNet,
+        # V4 冲榜：timm 预训练编码器 + Multi-scale FiLM
+        "conditional_unet_v4": ConditionalTimmUNet,
     }
 
     # 需要 marker_idx 输入（一对多联合建模）的模型类型。
@@ -925,6 +1055,7 @@ class ModelRegistry:
         "conditional_unet_v2",
         "adapter_unet",
         "conditional_unet_v3",
+        "conditional_unet_v4",
     }
 
     @classmethod

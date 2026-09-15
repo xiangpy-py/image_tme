@@ -115,6 +115,7 @@ data / utils  <-  train  <-  layout  <-  allocate  <-  operate  ->  feedback
 | --- | --- | --- |
 | `analyze` | 数据统计分析 | `DatasetAnalyzer.analyze` |
 | `split` | 按 ROI 划分训练/验证集 | `DatasetSplitter.create` |
+| `align` | DAPI 与各标记的配准误差估计 | `AlignmentAnalyzer.analyze` |
 | `train` | 单实验训练 | `Operator.train_experiment` |
 | `experiments` | 实验矩阵：筛选 + Top-K 长训练 | `Operator.run_experiments` |
 | `infer` | 测试集推理并生成提交结果 | `Predictor.run_experiment` |
@@ -207,7 +208,27 @@ uv run main.py infer --config <FILE> [--exp NAME] [--ckpt-all FILE] [--ckpt-<标
 
 输出：`results/test/<MARKER>/<原名>_fake.jpg`（统一三通道 JPG，兼容按灰度或按 RGB 读取的评测脚本）。
 
-### 3.6 ensemble
+### 3.6 align
+
+```bash
+uv run main.py align [--root data] [--sample-limit 500] [--max-shift 8] [--output data/alignment.json]
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--root` | `data` | 数据根目录 |
+| `--sample-limit` | `500` | 每个标记最多抽样的样本数 |
+| `--max-shift` | `8` | 可信平移量上限（像素），超过判定为无效估计 |
+| `--output` | `data/alignment.json` | 校正表输出路径 |
+
+用相位相关逐样本估计 DAPI 与各目标标记的平移量：mIHC 多轮染色/扫描
+若存在通道间错位，会给 SSIM/PSNR 设硬上限。输出含各标记统计量
+（dy/dx 均值、P95、有效估计数）与逐样本平移向量；训练配置中设置
+`data.alignment_file` 即可启用训练集目标图平移校正。
+**判读**：P95 持续 ≥1 像素才值得启用；本数据集（colon）实测相位相关
+响应接近噪声水平、无系统性错位，默认不启用。
+
+### 3.7 ensemble
 
 ```bash
 uv run main.py ensemble --config <FILE> --exps NAME [NAME ...]
@@ -231,10 +252,13 @@ uv run main.py ensemble --config <FILE> --exps NAME [NAME ...]
 | | `cache` | 是否内存缓存解码后的图像（大内存机器建议开启） |
 | | `prefetch_factor` | 每个 worker 预取的 batch 数 |
 | | `marker_weights` | 标记均衡采样权重 `{标记名: 权重}`，仅条件模型的训练集生效（验证集按样本下标确定性轮转标记）；用于给弱势标记更多梯度 |
+| | `alignment_file` | 配准校正表路径（`align` 命令生成）；设置后训练集目标图按整数像素平移回与 DAPI 对齐，验证集保持赛方原始口径 |
+| `evaluation` | `ssim_impl` | 验证/选模的 SSIM 口径：`gaussian`（训练同款 11×11 高斯窗，快）｜ `skimage`（赛方评测大概率的 skimage 默认参数，选 best.pth 更贴近线上分） |
 | `model` | `type` | `unet` / `resnet_unet` / `conditional_unet` / `conditional_unet_v2` / `adapter_unet` / `conditional_unet_v3` |
 | | 其余字段 | 各模型构造参数，如 `in_channels` / `out_channels` / `base_channels` / `depth` / `num_markers` / `embed_dim` / `return_shared` / `backbone` / `pretrained` |
 | `loss` | `lambda_l1` / `lambda_ssim` | L1 与 SSIM 损失权重 |
 | | `lambda_mse` | MSE 损失权重（PSNR 的直接代理，占综合分 30%） |
+| | `lambda_gdl` | 梯度差损失权重（0 关闭）：惩罚一阶梯度幅值差，对抗回归的平滑偏置 |
 | | `lambda_edge` / `edge_kernel_size` / `edge_smooth_sigma` | 边缘损失权重与 Sobel/高斯参数 |
 | | `lambda_tv` / `tv_mode` | TV 正则权重（0 关闭）与模式：`match` 对齐真值总变差 ｜ `penalty` 最小化预测总变差 |
 | | `lambda_cross` | 跨标记一致性权重（仅 `adapter_unet` 且 `return_shared: true` 生效） |
@@ -254,7 +278,7 @@ uv run main.py ensemble --config <FILE> --exps NAME [NAME ...]
 损失组合：
 
 ```
-L = λ_l1·L1 + λ_mse·MSE + λ_ssim·SSIM + λ_edge·Edge + λ_tv·TV + λ_cross·CrossMarker
+L = λ_l1·L1 + λ_mse·MSE + λ_ssim·SSIM + λ_edge·Edge + λ_gdl·GDL + λ_tv·TV + λ_cross·CrossMarker
 ```
 
 > 注：`lambda_tv` 默认 0（关闭）。本任务实测模型预测的总变差仅为真值的约
@@ -321,6 +345,7 @@ data/
 | ConditionalUNet | `conditional_unet` | 一对多：瓶颈注入 marker 嵌入 |
 | ConditionalUNetV2 | `conditional_unet_v2` | 一对多：多尺度 FiLM 逐层注入 |
 | ConditionalResAttentionUNet | `conditional_unet_v3` | 一对多：残差块 + 深层 CBAM 注意力 + 多尺度 FiLM（主力） |
+| ConditionalTimmUNet | `conditional_unet_v4` | 一对多：timm ImageNet 预训练编码器（默认 ConvNeXt-Tiny）+ 多尺度 FiLM（冲榜） |
 | AdapterUNet | `adapter_unet` | 一对多：共享编解码器 + 标记适配器，可配跨标记一致性 |
 
 训练要点：
@@ -343,36 +368,13 @@ data/
 - 排行榜逐波次增量落盘，训练中断也不会丢失已完成作业的成绩。
 - `runtime.deterministic: false` 时启用 cuDNN 自动调优以获得更快训练速度。
 
-> **评测口径说明（已用官方反馈反推确认）**：赛题只给出
-> `Score = 70% × SSIM + 30% × Normalize(PSNR)`，未定义 `Normalize(PSNR)`。
-> 本项目按真实提交反馈反推出：
+> **评测口径说明**：赛题仅给出 `Score = 70% × SSIM + 30% × Normalize(PSNR)`，
+> 未定义 `Normalize(PSNR)`。经与赛方评分结果比对反推，归一化分母 D≈50：
+> 将 PSNR 裁剪到 `[0, 50] dB` 后除以 50（见 [src/train/metrics.py](src/train/metrics.py)），
+> 若官方口径再变仅需改 `PSNR_UPPER_BOUND`。
 >
-> ```
-> Score = 70 × SSIM + 30 × clip(PSNR, 0, 50) / 50      # 百分制
-> ```
->
-> 依据：某次提交反馈 SSIM = 0.804 / 0.790 / 0.784 / 0.762、
-> PSNR = 25.393 / 22.462 / 21.758 / 21.587（均值 0.7850 / 22.8000），
-> 官方总分 **68.6337**；代入上式反解归一化分母得 `D = 49.99`，按 `D = 50`
-> 复算得 68.6300，偏差 0.0037（小于指标三位小数的舍入量）。
->
-> 关键点：**上界是 50 dB 而不是 40 dB**。早期按经验假定 40，会把本地读数
-> 系统性抬高约 3.5 分（同一模型 71.66 对实际的 68.63），这正是「本地分数与
-> 线上对不上」的全部来源。另外官方 PSNR 采用**逐图计算再跨图平均**口径，
-> 一致高于按全局 MSE 计算的读数（实测 +0.18~+1.88 dB），本项目已把主口径
-> 切换为逐图平均，并保留 `psnr_global` 供对照。
->
-> 用 `marker-report --online "<赛方反馈原文>"` 可把官方反馈与本地读数逐标记
-> 对照，判定本地验证集能否预测线上得分，结果追加到
-> `logs/submission_check.csv`：
->
-> ```bash
-> uv run main.py marker-report --config configs/conditional_v3.yaml \
->     --exp exp010_conditional_v3 \
->     --online "指标=CD68:SSIM=0.802,PSNR=25.344;CD45RO:SSIM=0.782,PSNR=22.342"
-> ```
->
-> 详见 [src/train/metrics.py](src/train/metrics.py) 的模块文档。
+> **提交图像编码**：推理结果以 JPEG quality=100 + 4:4:4（不色度子采样）保存，
+> 保证三通道解码后完全相等，避免评测按灰度加权读取时引入压缩噪声。
 
 > 依赖清单见 `pyproject.toml`；本项目为应用型工程（`[tool.uv] package = false`），
 > 统一通过 `uv run main.py ...` 调用。
