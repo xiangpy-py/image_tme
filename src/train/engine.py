@@ -12,6 +12,7 @@
 兼容单标记模型与多标记条件模型（按模型类型决定是否传入 ``marker_idx``）。
 """
 
+import csv
 import time
 import warnings
 from pathlib import Path
@@ -36,7 +37,7 @@ from ..utils import (
 )
 from .data import DataLoaders
 from .losses import CombinedLoss
-from .metrics import AverageMeter, MetricAccumulator
+from .metrics import AverageMeter, MetricAccumulator, OfficialFeedback
 from .models import ModelRegistry
 
 
@@ -827,6 +828,10 @@ class MarkerEvaluator:
     赛题对多输出取平均分，因此最差标记的边际收益最大（HEMIT 论文亦指出
     模型易系统性忽视弱势标记）。本类对每个标记独立累计指标，输出
     SSIM/PSNR/Score 对照表并标出短板，供损失权重或采样策略调整参考。
+
+    指标口径与赛方评分脚本对齐（``Normalize(PSNR)`` 上界 50 dB、
+    PSNR 逐图平均，见 ``metrics`` 模块文档）；传入 ``online`` 参数时还会
+    把赛方反馈与本地读数逐标记对照，用于校验本地验证集的可信度。
     """
 
     def __init__(self, config: Dict[str, Any]) -> None:
@@ -926,9 +931,12 @@ class MarkerEvaluator:
             report[marker] = self._evaluate_loader(
                 model, loader, marker_idx=idx, desc=f"eval [{marker}]"
             )
+            # 同时回显两种 PSNR 口径：逐图平均（对齐赛方）与全局 MSE（诊断）。
             self.logger.info(
                 f"[{marker}] SSIM={report[marker]['ssim']:.4f} | "
-                f"PSNR={report[marker]['psnr']:.2f} | Score={report[marker]['score']:.4f}"
+                f"PSNR={report[marker]['psnr']:.2f}(逐图) / "
+                f"{report[marker]['psnr_global']:.2f}(全局) | "
+                f"Score={report[marker]['score']:.4f}"
             )
 
         # 释放模型占用的显存/内存。
@@ -940,6 +948,7 @@ class MarkerEvaluator:
         experiment: Optional[str] = None,
         overrides: Optional[Dict[str, str]] = None,
         checkpoint_root: str = "checkpoints",
+        online: Optional[str] = None,
     ) -> Dict[str, Dict[str, float]]:
         """执行逐标记评估并打印对照表，末尾标出短板标记与平均分。
 
@@ -947,6 +956,10 @@ class MarkerEvaluator:
             experiment:      实验名。
             overrides:       checkpoint 手动覆盖项。
             checkpoint_root: checkpoint 根目录。
+            online:          赛方自动评分反馈原文，或存放该文本的文件路径。
+                提供时会额外打印「线上 vs 本地」逐标记对照，并把本次对照
+                追加到 ``logs/submission_check.csv``，用于校验本地验证集
+                能否预测赛方测试集得分。
 
         Returns:
             Dict[str, Dict[str, float]]: 各标记指标明细。
@@ -957,15 +970,153 @@ class MarkerEvaluator:
         mean_score = sum(item["score"] for item in report.values()) / len(report)
         worst = min(report, key=lambda marker: report[marker]["score"])
 
-        print(f"\n{'标记':<12}{'SSIM':<10}{'PSNR(dB)':<12}{'Score':<10}")
-        print("-" * 44)
+        print(
+            f"\n{'标记':<12}{'SSIM':<10}{'PSNR逐图':<12}{'PSNR全局':<12}{'Score':<10}"
+        )
+        print("-" * 56)
         for marker, item in report.items():
             flag = "  <- 短板" if marker == worst else ""
             print(
                 f"{marker:<12}{item['ssim']:<10.4f}{item['psnr']:<12.2f}"
-                f"{item['score']:<10.4f}{flag}"
+                f"{item['psnr_global']:<12.2f}{item['score']:<10.4f}{flag}"
             )
-        print("-" * 44)
-        print(f"四标记平均 Score: {mean_score:.4f}")
+        print("-" * 56)
+        print(f"四标记平均 Score: {100 * mean_score:.4f}（百分制，对齐赛方口径）")
         print(f"短板标记: {worst}（优先为其调整损失权重或采样比例）")
+
+        if online:
+            self._compare_with_official(online, experiment, report)
         return report
+
+    def _compare_with_official(
+        self,
+        online: str,
+        experiment: Optional[str],
+        local: Dict[str, Dict[str, float]],
+    ) -> None:
+        """把赛方反馈与本地读数逐标记对照，并落盘到提交校验记录。
+
+        同时用「线上 PSNR 更接近本地的哪一种 PSNR 口径」反推赛方的
+        PSNR 聚合方式，避免长期在错误口径上做模型选择。
+
+        Args:
+            online:     反馈原文或存放反馈的文件路径。
+            experiment: 实验名，写入校验记录便于回溯。
+            local:      本地逐标记评测结果。
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: 反馈文本无法解析时抛出。
+        """
+        text = online
+        candidate = Path(online)
+        if "\n" not in online and candidate.is_file():
+            text = candidate.read_text(encoding="utf-8")
+
+        feedback = OfficialFeedback.parse(text)
+        rows = feedback.compare(local)
+        if not rows:
+            raise ValueError("反馈中解析出的标记与本地评测结果无交集，请核对标记名")
+        summary = feedback.summarize()
+
+        print(
+            f"\n{'标记':<12}{'线上SSIM':<10}{'本地SSIM':<10}{'ΔSSIM':<10}"
+            f"{'线上PSNR':<10}{'本地PSNR':<10}{'ΔPSNR':<10}{'ΔPSNR全局':<11}"
+        )
+        print("-" * 83)
+        for row in rows:
+            print(
+                f"{row['marker']:<12}{row['ssim_online']:<10.4f}"
+                f"{row['ssim_local']:<10.4f}{row['d_ssim']:<+10.4f}"
+                f"{row['psnr_online']:<10.2f}{row['psnr_local']:<10.2f}"
+                f"{row['d_psnr']:<+10.2f}{row['d_psnr_global']:<+11.2f}"
+            )
+        print("-" * 83)
+
+        count = len(rows)
+        mean_d_ssim = sum(row["d_ssim"] for row in rows) / count
+        mean_d_psnr = sum(row["d_psnr"] for row in rows) / count
+        bias_image = sum(abs(row["d_psnr"]) for row in rows) / count
+        bias_global = sum(abs(row["d_psnr_global"]) for row in rows) / count
+        aggregation = "逐图平均" if bias_image <= bias_global else "全局 MSE"
+
+        print(
+            f"线上四标记平均 Score: 复算 {summary['score']:.4f} | "
+            f"官方反馈 {summary['score_reported']:.4f}"
+        )
+        print(f"本地 vs 线上: ΔSSIM 均值 {mean_d_ssim:+.4f} | ΔPSNR 均值 {mean_d_psnr:+.2f} dB")
+        print(
+            f"PSNR 聚合口径: 更接近本地的「{aggregation}」口径"
+            f"（平均绝对偏差 {min(bias_image, bias_global):.2f} dB）"
+        )
+        self._append_submission_record(experiment, rows, summary)
+
+    @staticmethod
+    def _append_submission_record(
+        experiment: Optional[str],
+        rows: List[Dict[str, float]],
+        summary: Dict[str, float],
+        path: str = "logs/submission_check.csv",
+    ) -> None:
+        """把一次「线上 vs 本地」对照追加到提交校验记录。
+
+        多条记录累积后可评估本地验证集读数与线上得分的相关性，
+        即「本地实验的排序是否可信」。
+
+        Args:
+            experiment: 实验名。
+            rows:       逐标记对照行。
+            summary:    线上汇总指标。
+            path:       记录文件路径。
+
+        Returns:
+            None
+        """
+        csv_path = Path(path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "time",
+            "experiment",
+            "marker",
+            "ssim_online",
+            "ssim_local",
+            "d_ssim",
+            "psnr_online",
+            "psnr_local",
+            "d_psnr",
+            "psnr_global_local",
+            "d_psnr_global",
+            "score_online",
+            "score_local",
+        ]
+        is_new = not csv_path.is_file()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        with open(csv_path, "a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            if is_new:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        "time": timestamp,
+                        "experiment": experiment or "",
+                        "marker": row["marker"],
+                        "ssim_online": f"{row['ssim_online']:.4f}",
+                        "ssim_local": f"{row['ssim_local']:.4f}",
+                        "d_ssim": f"{row['d_ssim']:+.4f}",
+                        "psnr_online": f"{row['psnr_online']:.3f}",
+                        "psnr_local": f"{row['psnr_local']:.3f}",
+                        "d_psnr": f"{row['d_psnr']:+.3f}",
+                        "psnr_global_local": f"{row['psnr_global_local']:.3f}",
+                        "d_psnr_global": f"{row['d_psnr_global']:+.3f}",
+                        "score_online": f"{row['score_online']:.4f}",
+                        "score_local": f"{row['score_local']:.4f}",
+                    }
+                )
+        print(
+            f"线上平均 SSIM={summary['ssim']:.4f} PSNR={summary['psnr']:.3f} "
+            f"| 对照已追加到 {csv_path}"
+        )

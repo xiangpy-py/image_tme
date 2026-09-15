@@ -343,10 +343,36 @@ data/
 - 排行榜逐波次增量落盘，训练中断也不会丢失已完成作业的成绩。
 - `runtime.deterministic: false` 时启用 cuDNN 自动调优以获得更快训练速度。
 
-> **评测口径说明**：赛题仅给出 `Score = 70% × SSIM + 30% × Normalize(PSNR)`，
-> 未定义 `Normalize(PSNR)`。本项目取最常见做法：将 PSNR 裁剪到 `[0, 40] dB`
-> 后除以 40 归一化（见 [src/train/metrics.py](src/train/metrics.py)），
-> 若官方口径不同需据此调整。
+> **评测口径说明（已用官方反馈反推确认）**：赛题只给出
+> `Score = 70% × SSIM + 30% × Normalize(PSNR)`，未定义 `Normalize(PSNR)`。
+> 本项目按真实提交反馈反推出：
+>
+> ```
+> Score = 70 × SSIM + 30 × clip(PSNR, 0, 50) / 50      # 百分制
+> ```
+>
+> 依据：某次提交反馈 SSIM = 0.804 / 0.790 / 0.784 / 0.762、
+> PSNR = 25.393 / 22.462 / 21.758 / 21.587（均值 0.7850 / 22.8000），
+> 官方总分 **68.6337**；代入上式反解归一化分母得 `D = 49.99`，按 `D = 50`
+> 复算得 68.6300，偏差 0.0037（小于指标三位小数的舍入量）。
+>
+> 关键点：**上界是 50 dB 而不是 40 dB**。早期按经验假定 40，会把本地读数
+> 系统性抬高约 3.5 分（同一模型 71.66 对实际的 68.63），这正是「本地分数与
+> 线上对不上」的全部来源。另外官方 PSNR 采用**逐图计算再跨图平均**口径，
+> 一致高于按全局 MSE 计算的读数（实测 +0.18~+1.88 dB），本项目已把主口径
+> 切换为逐图平均，并保留 `psnr_global` 供对照。
+>
+> 用 `marker-report --online "<赛方反馈原文>"` 可把官方反馈与本地读数逐标记
+> 对照，判定本地验证集能否预测线上得分，结果追加到
+> `logs/submission_check.csv`：
+>
+> ```bash
+> uv run main.py marker-report --config configs/conditional_v3.yaml \
+>     --exp exp010_conditional_v3 \
+>     --online "指标=CD68:SSIM=0.802,PSNR=25.344;CD45RO:SSIM=0.782,PSNR=22.342"
+> ```
+>
+> 详见 [src/train/metrics.py](src/train/metrics.py) 的模块文档。
 
 > 依赖清单见 `pyproject.toml`；本项目为应用型工程（`[tool.uv] package = false`），
 > 统一通过 `uv run main.py ...` 调用。

@@ -145,16 +145,16 @@ def cmd_infer(args: argparse.Namespace) -> None:
 
 
 def cmd_marker_report(args: argparse.Namespace) -> None:
-    """逐标记短板分析：把 ``--ckpt-*`` 覆盖项整理后交给逐标记评估器。
+    """逐标记短板分析：整理覆盖项后交给逐标记评估器。
 
     Args:
-        args: 含 ``config`` / ``exp`` / 各标记 checkpoint 覆盖项。
+        args: 含 ``config`` / ``exp`` / ``online`` 与各标记 checkpoint 覆盖项。
 
     Returns:
         None
     """
     MarkerEvaluator(ConfigManager.load(args.config)).report(
-        args.exp, collect_ckpt_overrides(args)
+        args.exp, collect_ckpt_overrides(args), online=args.online
     )
 
 
@@ -483,12 +483,15 @@ def parse_args() -> argparse.Namespace:
         description=(
             "在同一验证集上分别评估四种标记（SSIM/PSNR/Score），"
             "按赛题「多输出取平均分」口径标出短板标记，"
-            "供损失权重或采样策略调整参考。"
+            "供损失权重或采样策略调整参考；"
+            "指标口径已与赛方评分脚本对齐（PSNR 归一化上界 50 dB）。"
         ),
         epilog=(
             "示例:\n"
-            "  uv run main.py marker-report --config configs/baseline.yaml --exp exp001_unet_baseline\n"
-            "  uv run main.py marker-report --config configs/conditional_v2.yaml --exp exp006_conditional_v2"
+            "  uv run main.py marker-report --config configs/conditional_v3.yaml --exp exp010_conditional_v3\n"
+            "  # 用赛方反馈校验本地验证集的可信度（会追加 logs/submission_check.csv）\n"
+            "  uv run main.py marker-report --config configs/submit_p10.yaml "
+            "--exp p10_aug_geoonly --online \"指标=CD68:SSIM=0.802,PSNR=25.344;...\""
         ),
         formatter_class=FORMATTER,
     )
@@ -521,6 +524,16 @@ def parse_args() -> argparse.Namespace:
             metavar="FILE",
             help=f"标记 {marker} 的单模型 checkpoint（优先于 --exp）",
         )
+    report_parser.add_argument(
+        "--online",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help=(
+            "赛方自动评分反馈原文（或存放该文本的文件路径）；提供后额外打印"
+            "「线上 vs 本地」逐标记对照，用于校验本地验证集能否预测线上得分"
+        ),
+    )
     report_parser.set_defaults(func=cmd_marker_report)
 
     # ---- ensemble ----

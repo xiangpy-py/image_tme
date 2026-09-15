@@ -20,8 +20,9 @@ from .losses import (
     SSIM,
     SSIMLoss,
     SobelEdgeLoss,
+    TVLoss,
 )
-from .metrics import AverageMeter, MetricAccumulator, Metrics
+from .metrics import AverageMeter, MetricAccumulator, Metrics, OfficialFeedback
 from .models import (
     AdapterUNet,
     ConditionalResAttentionUNet,
@@ -57,7 +58,9 @@ __all__ = [
     "Metrics",
     "MetricAccumulator",
     "AverageMeter",
+    "OfficialFeedback",
     # 引擎
     "Trainer",
     "Predictor",
+    "MarkerEvaluator",
 ]
