@@ -230,10 +230,13 @@ uv run main.py ensemble --config <FILE> --exps NAME [NAME ...]
 | | `num_workers` | DataLoader 进程数；留空按 CPU 核心数自动探测 |
 | | `cache` | 是否内存缓存解码后的图像（大内存机器建议开启） |
 | | `prefetch_factor` | 每个 worker 预取的 batch 数 |
+| | `marker_weights` | 标记均衡采样权重 `{标记名: 权重}`，仅条件模型的训练集生效（验证集按样本下标确定性轮转标记）；用于给弱势标记更多梯度 |
 | `model` | `type` | `unet` / `resnet_unet` / `conditional_unet` / `conditional_unet_v2` / `adapter_unet` / `conditional_unet_v3` |
 | | 其余字段 | 各模型构造参数，如 `in_channels` / `out_channels` / `base_channels` / `depth` / `num_markers` / `embed_dim` / `return_shared` / `backbone` / `pretrained` |
 | `loss` | `lambda_l1` / `lambda_ssim` | L1 与 SSIM 损失权重 |
+| | `lambda_mse` | MSE 损失权重（PSNR 的直接代理，占综合分 30%） |
 | | `lambda_edge` / `edge_kernel_size` / `edge_smooth_sigma` | 边缘损失权重与 Sobel/高斯参数 |
+| | `lambda_tv` / `tv_mode` | TV 正则权重（0 关闭）与模式：`match` 对齐真值总变差 ｜ `penalty` 最小化预测总变差 |
 | | `lambda_cross` | 跨标记一致性权重（仅 `adapter_unet` 且 `return_shared: true` 生效） |
 | `augmentation` | `hflip_prob` / `vflip_prob` / `rotate90` | 几何增强（对输入与真值同步施加） |
 | | `brightness` / `contrast` / `noise_std` | 光度扰动（仅作用于输入 DAPI） |
@@ -251,8 +254,12 @@ uv run main.py ensemble --config <FILE> --exps NAME [NAME ...]
 损失组合：
 
 ```
-L = λ_l1·L1 + λ_ssim·SSIM + λ_edge·Edge + λ_cross·CrossMarker
+L = λ_l1·L1 + λ_mse·MSE + λ_ssim·SSIM + λ_edge·Edge + λ_tv·TV + λ_cross·CrossMarker
 ```
+
+> 注：`lambda_tv` 默认 0（关闭）。本任务实测模型预测的总变差仅为真值的约
+> 1/3（**输出已偏平滑**），因此 `tv_mode: penalty`（最小化预测 TV）会与评分
+> 口径相悖，推荐试 `tv_mode: match`（对齐真值总变差）。
 
 ### 实验矩阵格式
 

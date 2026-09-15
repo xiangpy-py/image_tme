@@ -22,8 +22,13 @@ screening:
   marker: CD68          # 仅单标记模型使用；本矩阵全为复合模型，该字段不生效
 
 full:
-  epochs: 100           # 长训练轮数
-  top_k: 3              # 进入长训练的实验数
+  epochs: 150           # 长训练轮数（V3 实测约 55s/epoch，150 轮约 2.3 小时）
+  # top_k 由 3 降到 1：p14/p15/p16 三条 λ_mse 实验得分几乎完全相同
+  # （0.7000 / 0.6999 / 0.6998），按分数取前 3 等于把同一个配置长训三遍，纯浪费算力。
+  # 注意：本阶段按得分自动选出的第一名是 p14_mse05（其 overrides 仍把 λ_mse 覆盖回 0.5）。
+  # 当前冲榜方案是 configs/conditional_v3.yaml（λ_mse=1.0 的 V3 基线），两者统计上等价，
+  # 因此推荐直接用 `uv run main.py train --config configs/conditional_v3.yaml` 长训。
+  top_k: 1              # 进入长训练的实验数
 
 # 每个实验 = 固定骨干 configs/conditional_v2.yaml + overrides 单变量覆盖（递归合并）。
 # name 会写入 experiment.name；screening 阶段自动追加 _screen 后缀。
@@ -91,3 +96,52 @@ experiments:
   #     与上面 10 个 V2 超参候选同台筛选；--resume 下旧实验秒退，只新训本条。
   - name: p11_resattn_v3
     base: configs/conditional_v3.yaml
+
+  # ================================================================ #
+  # 以下基于 V3 骨干，针对「实测短板」做定向实验。
+  #
+  # 标定依据（在 V3 训练满 15 轮权重上实测的损失分项量纲，四标记平均）：
+  #   L1≈0.046 | MSE≈0.0088 | SSIM≈0.224 | 边缘≈0.065 | TV(预测)≈0.0062
+  #   TV(真值)≈0.0188（预测的总变差只有真值的 1/3，即模型本身已偏平滑）
+  # 据此换算权重，使新分项的贡献与边缘项（0.10×0.065≈0.0065）同量级。
+  # ================================================================ #
+
+  # ---- TV 正则：两种语义相反的写法，一次筛清方向 ----
+  # match  ：|TV(pred)-TV(target)|，要求结构变化量与真值相当（默认，风险低）
+  # penalty：直接最小化 TV(pred)，抑制伪影但会把已偏平滑的输出推得更平
+  - name: p12_v3_tv_match
+    base: configs/conditional_v3.yaml
+    overrides:
+      loss: {lambda_tv: 0.5, tv_mode: match}
+
+  - name: p13_v3_tv_penalty
+    base: configs/conditional_v3.yaml
+    overrides:
+      loss: {lambda_tv: 1.0, tv_mode: penalty}
+
+  # ---- λ_mse 扫描：PSNR 占综合分 30%，此前从未扫过这条轴 ----
+  # 文献实测（marker-wise diffusion 论文）：纯 L1 偏 SSIM、纯 L2 偏 PSNR，
+  # 二者正是 0.7/0.3 加权下的权衡轴；当前 λ_mse=0.20 时 MSE 项仅占总损失约 2%。
+  - name: p14_mse05
+    base: configs/conditional_v3.yaml
+    overrides:
+      loss: {lambda_mse: 0.5}
+
+  - name: p15_mse10
+    base: configs/conditional_v3.yaml
+    overrides:
+      loss: {lambda_mse: 1.0}
+
+  - name: p16_mse20
+    base: configs/conditional_v3.yaml
+    overrides:
+      loss: {lambda_mse: 2.0}
+
+  # ---- 标记均衡采样：CD45RO 是最弱标记（SSIM 0.704 对四标记均值 0.777）----
+  # 权重 2.0 表示其被采样概率由 25% 提升到 40%，用于验证「弱势标记投入更多
+  # 梯度能否提升四标记平均分」；仅作用于训练集，验证集仍确定性轮转标记。
+  - name: p17_cd45ro_w2
+    base: configs/conditional_v3.yaml
+    overrides:
+      data: {marker_weights: {CD45RO: 2.0}}
+

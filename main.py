@@ -22,7 +22,7 @@ from src.data import ContextGenerator, DatasetAnalyzer, DatasetSplitter
 from src.data.constants import MARKERS
 from src.ensemble import Ensembler
 from src.operate import Operator
-from src.train import Predictor
+from src.train import MarkerEvaluator, Predictor
 from src.utils import ConfigManager
 
 # 保留换行的帮助格式，便于在 epilog 中书写多行示例。

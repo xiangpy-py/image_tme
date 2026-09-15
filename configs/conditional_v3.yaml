@@ -37,7 +37,12 @@ model:
 
 loss:
   lambda_l1: 0.35            # 整体颜色/结构，抑制离群值
-  lambda_mse: 0.20           # PSNR 的精确代理（占综合分 30%）
+  # λ_mse 由 0.20 提到 1.0：筛选实验 p14/p15/p16（0.5/1.0/2.0）一致微超基线 +0.001，
+  # 且复现了「L1 偏 SSIM、L2 偏 PSNR」的权衡——λ 越大 PSNR 越高、SSIM 略降：
+  #   λ=0.2 -> PSNR 20.67 SSIM 0.7770 ｜ λ=1.0 -> PSNR 20.82 SSIM 0.7768
+  #   λ=0.5 -> PSNR 20.76 SSIM 0.7775 ｜ λ=2.0 -> PSNR 20.94 SSIM 0.7754
+  # 0.5~2.0 区间得分持平，取中值 1.0 兼顾两端稳定性。
+  lambda_mse: 1.0            # PSNR 的精确代理（占综合分 30%）
   lambda_ssim: 0.35          # 比赛主指标（占综合分 70%）
   lambda_edge: 0.10          # Sobel 梯度损失，防止细胞/组织边界模糊（过重会掉分）
   edge_kernel_size: 3
@@ -47,9 +52,14 @@ augmentation:
   hflip_prob: 0.5
   vflip_prob: 0.5
   rotate90: true
-  brightness: 0.1
-  contrast: 0.1
-  noise_std: 0.01
+  # 光度扰动关闭：仿射光度抖动只作用于输入 DAPI、不改动真值，等于要求模型
+  # 对输入亮度/对比度不敏感，而本任务是绝对强度回归（SSIM/PSNR 按像素比）。
+  # 实验矩阵单变量对照已证实（logs/leaderboard.csv）：
+  #   p10_aug_geoonly 关掉后 screening 0.6864 / full 0.7086，
+  #   参照组 p00 仅 0.6558 / 0.6649，差距远超其他超参实验的波动带。
+  brightness: 0.0
+  contrast: 0.0
+  noise_std: 0.0
 
 training:
   epochs: 150
@@ -61,7 +71,10 @@ training:
   ema: true                  # 权重滑动平均
   ema_eval_every: 5          # EMA 权重每 5 轮评估一次，降低验证开销
   amp: true                  # 混合精度，仅 CUDA 生效
-  compile: true              # torch.compile 图优化，仅 CUDA 生效
+  # 注意：本机 torch 2.11 下 torch.compile + fp16 反向会产生大规模 NaN 梯度
+  # （探针实测 105/144 参数 NaN，GradScaler 全程跳过 optimizer.step，训练冻结），
+  # 必须关闭 compile；fp16 不带 compile 已实测梯度干净。
+  compile: false             # torch.compile 图优化，仅 CUDA 生效
 
 inference:
   output_dir: results

@@ -1,0 +1,29 @@
+# 提交推理配置：复现长训练冠军实验 p10_aug_geoonly 的模型结构，
+# 仅用于测试集推理；模型段必须与训练时完全一致，权重通过命令行
+# --ckpt-all 显式指定，避免按实验名自动查找产生歧义。
+
+experiment:
+  name: p10_aug_geoonly
+
+data:
+  root: data              # 测试集位于 data/test/DAPI
+  num_workers: 8
+  cache: true
+
+model:
+  type: conditional_unet_v2
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  depth: 4
+  num_markers: 4
+  embed_dim: 128
+
+inference:
+  output_dir: results
+  suffix: _fake
+  tta: true               # 测试时增强：8 视图几何平均，稳定提升指标
+
+runtime:
+  device: auto
+  seed: 42

@@ -50,6 +50,7 @@ __all__ = [
     "SSIM",
     "SSIMLoss",
     "SobelEdgeLoss",
+    "TVLoss",
     "CrossMarkerConsistencyLoss",
     "CombinedLoss",
     # 指标

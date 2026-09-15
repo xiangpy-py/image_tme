@@ -2,13 +2,14 @@
 
 组合损失::
 
-    L = λ_l1·L1 + λ_mse·MSE + λ_ssim·SSIM + λ_edge·Edge + λ_cross·CrossMarker
+    L = λ_l1·L1 + λ_mse·MSE + λ_ssim·SSIM + λ_edge·Edge + λ_cross·CrossMarker + λ_tv·TV
 
 - ``MSE``：均方误差，是评测指标 PSNR 的精确代理（PSNR 由全局 MSE 单调
   决定，占综合分 30%）；L1 优化中位数而 MSE 优化均值，二者互补；
 - ``SSIM`` / ``SSIMLoss``：结构相似性，比赛主指标之一（占综合分 70%），
   设计为可微损失直接优化；
 - ``SobelEdgeLoss``：约束细胞边界/组织边缘的结构一致性；
+- ``TVLoss``：约束生成图的结构变化量（默认与真值对齐），抑制伪影；
 - ``CrossMarkerConsistencyLoss``：一对多建模时约束共享特征与标记无关；
 - ``CombinedLoss``：按权重装配以上分项，权重为 0 即关闭。
 """
@@ -253,6 +254,64 @@ class SobelEdgeLoss(nn.Module):
         return F.l1_loss(pred_edge, target_edge)
 
 
+class TVLoss(nn.Module):
+    """总变差（Total Variation）正则：约束生成图的结构变化量并抑制伪影。
+
+    提供两种模式，语义与适用场景不同：
+
+    - ``"penalty"``：直接最小化预测的 TV，压制噪声、棋盘伪影等虚假细节；
+    - ``"match"``：最小化 ``|TV(pred) - TV(target)|``，要求生成图与真值具有
+      相当的结构变化量，既不模糊也不引入多余纹理。
+
+    模式选择依据：本任务实测预测的 TV 仅为真值的 1/3（0.0062 对 0.0188），
+    说明模型输出本身已明显偏平滑，此时 ``"penalty"`` 会把它推得更平、
+    与评分口径相悖，故默认采用 ``"match"``。
+    """
+
+    def __init__(self, mode: str = "match") -> None:
+        """初始化正则模式。
+
+        Args:
+            mode: ``"match"`` 对齐真值 TV ｜ ``"penalty"`` 最小化预测 TV。
+
+        Raises:
+            ValueError: 模式取值非法时抛出。
+        """
+        super().__init__()
+        if mode not in ("match", "penalty"):
+            raise ValueError(f"不支持的 TV 模式: {mode}，可选: match / penalty")
+        self.mode = mode
+
+    @staticmethod
+    def _total_variation(x: torch.Tensor) -> torch.Tensor:
+        """计算各向异性 TV：横纵相邻像素绝对差之和的均值。
+
+        Args:
+            x: 图像张量 ``(B, C, H, W)``，取值 ``[0, 1]``。
+
+        Returns:
+            torch.Tensor: 标量 TV 值，越大表示结构变化越剧烈。
+        """
+        diff_h = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
+        diff_w = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+        return diff_h + diff_w
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """计算 TV 正则项。
+
+        Args:
+            pred:   预测图像 ``(B, C, H, W)``，取值 ``[0, 1]``。
+            target: 真值图像，形状与取值同 ``pred``。
+
+        Returns:
+            torch.Tensor: 标量损失，值域 ``[0, +inf)``。
+        """
+        pred_tv = self._total_variation(pred)
+        if self.mode == "penalty":
+            return pred_tv
+        return (pred_tv - self._total_variation(target)).abs()
+
+
 class CrossMarkerConsistencyLoss(nn.Module):
     """跨标记一致性损失：强制共享特征独立于标记类型。
 
@@ -324,6 +383,8 @@ class CombinedLoss(nn.Module):
         lambda_cross: float = 0.0,
         edge_kernel_size: int = 3,
         edge_smooth_sigma: float = 1.0,
+        lambda_tv: float = 0.0,
+        tv_mode: str = "match",
     ) -> None:
         """按权重装配各分项损失。
 
@@ -335,6 +396,8 @@ class CombinedLoss(nn.Module):
             lambda_cross:      跨标记一致性损失权重（仅 adapter 模型有效）。
             edge_kernel_size:  Sobel 核尺寸，3 或 5。
             edge_smooth_sigma: 边缘图高斯平滑标准差，<=0 表示不平滑。
+            lambda_tv:         TV 正则权重（0 表示关闭）。
+            tv_mode:           TV 模式，``"match"`` 对齐真值 ｜ ``"penalty"`` 最小化预测。
         """
         super().__init__()
         self.lambda_l1 = lambda_l1
@@ -342,6 +405,7 @@ class CombinedLoss(nn.Module):
         self.lambda_ssim = lambda_ssim
         self.lambda_edge = lambda_edge
         self.lambda_cross = lambda_cross
+        self.lambda_tv = lambda_tv
 
         self.l1 = nn.L1Loss()
         self.mse = nn.MSELoss() if lambda_mse > 0 else None
@@ -355,6 +419,7 @@ class CombinedLoss(nn.Module):
             else None
         )
         self.cross = CrossMarkerConsistencyLoss() if lambda_cross > 0 else None
+        self.tv = TVLoss(tv_mode) if lambda_tv > 0 else None
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "CombinedLoss":
@@ -375,6 +440,8 @@ class CombinedLoss(nn.Module):
             lambda_cross=float(loss_cfg.get("lambda_cross", 0.0)),
             edge_kernel_size=int(loss_cfg.get("edge_kernel_size", 3)),
             edge_smooth_sigma=float(loss_cfg.get("edge_smooth_sigma", 1.0)),
+            lambda_tv=float(loss_cfg.get("lambda_tv", 0.0)),
+            tv_mode=str(loss_cfg.get("tv_mode", "match")),
         )
 
     def forward(
@@ -416,6 +483,11 @@ class CombinedLoss(nn.Module):
             edge_value = self.edge(pred, target)
             total = total + self.lambda_edge * edge_value
             details["edge"] = float(edge_value.detach())
+
+        if self.tv is not None:
+            tv_value = self.tv(pred, target)
+            total = total + self.lambda_tv * tv_value
+            details["tv"] = float(tv_value.detach())
 
         if self.cross is not None and aux is not None:
             shared = aux.get("shared_features")

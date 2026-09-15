@@ -440,6 +440,7 @@ class MultiMarkerDataset(Dataset):
         file_list: Optional[List[str]] = None,
         cache: bool = False,
         random_marker: bool = True,
+        marker_weights: Optional[Dict[str, float]] = None,
         context_root: Optional[str] = None,
     ) -> None:
         """收集同时存在全部目标标记真值的样本。
@@ -456,6 +457,9 @@ class MultiMarkerDataset(Dataset):
             cache:     是否在内存中缓存全部解码图像（大内存机器建议开启）。
             random_marker: 是否随机采样目标标记；训练置 ``True``，
                 验证置 ``False`` 以按样本下标确定性轮转标记，稳定指标。
+            marker_weights: ``{标记名: 采样权重}``，用于标记均衡采样；
+                未列出的标记取 1.0，``None`` 表示等概率采样。四标记取平均
+                计分的赛制下，对弱势标记加权可提升其梯度占比。
             context_root: 多尺度上下文图根目录，``None`` 表示不使用。
 
         Raises:
@@ -466,6 +470,7 @@ class MultiMarkerDataset(Dataset):
         self.markers = markers or list(MARKERS)
         self.transform = transform
         self.random_marker = random_marker
+        self.marker_probs = self._resolve_marker_probs(marker_weights)
         root_path = Path(root)
         context_root_path = Path(context_root) if context_root else None
         # 文件名 -> (DAPI路径, {标记: 路径}, 上下文路径或 None)
@@ -523,6 +528,31 @@ class MultiMarkerDataset(Dataset):
                 for name, (source_path, target_map, context_path) in self.index.items()
             }
 
+    def _resolve_marker_probs(
+        self, marker_weights: Optional[Dict[str, float]]
+    ) -> Optional[np.ndarray]:
+        """把配置中的标记采样权重解析为与 ``self.markers`` 对齐的概率分布。
+
+        未配置、权重全为 0 或全为负时返回 ``None``，表示按标记等概率采样，
+        保持与历史实验一致的行为。
+
+        Args:
+            marker_weights: ``{标记名: 权重}``，未列出的标记取权重 1.0。
+
+        Returns:
+            Optional[np.ndarray]: 归一化概率数组；等概率采样时为 ``None``。
+        """
+        if not marker_weights:
+            return None
+        weights = np.array(
+            [max(float(marker_weights.get(name, 1.0)), 0.0) for name in self.markers],
+            dtype=np.float64,
+        )
+        total = float(weights.sum())
+        if total <= 0:
+            return None
+        return weights / total
+
     def __len__(self) -> int:
         """返回样本总数（每样本每 epoch 随机配对一种标记）。"""
         return len(self.names)
@@ -543,7 +573,13 @@ class MultiMarkerDataset(Dataset):
         # 确定性轮转标记，避免每轮验证的 marker 随机导致指标抖动、
         # 早停选点不稳定。
         if self.random_marker:
-            marker_idx = int(np.random.randint(0, len(self.markers)))
+            if self.marker_probs is None:
+                marker_idx = int(np.random.randint(0, len(self.markers)))
+            else:
+                # 标记均衡采样：按配置权重抽取，提升弱势标记的梯度占比。
+                marker_idx = int(
+                    np.random.choice(len(self.markers), p=self.marker_probs)
+                )
         else:
             marker_idx = index % len(self.markers)
         marker = self.markers[marker_idx]
@@ -638,6 +674,8 @@ class DataLoaders:
         cache = bool(data_cfg.get("cache", False))
         # 多尺度上下文：非空路径即启用，训练/验证/测试共用同一配置。
         context_root = data_cfg.get("context_dir") or None
+        # 标记采样权重：仅训练集生效，验证集按样本下标确定性轮转标记。
+        marker_weights = data_cfg.get("marker_weights") or None
 
         # ROI 划分文件必须存在：否则训练集与验证集会退化为同一份数据，
         # 造成严重的信息泄漏（验证指标虚高）。此处快速失败并提示修复方式。
@@ -656,6 +694,7 @@ class DataLoaders:
                     transform=PairedTransform.from_config(config, train=True),
                     file_list=train_list,
                     cache=cache,
+                    marker_weights=marker_weights,
                     context_root=context_root,
                 ),
                 MultiMarkerDataset(
